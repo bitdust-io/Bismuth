@@ -268,6 +268,7 @@ def bootstrap():
 
 def check_integrity(database):
     # check ledger integrity
+    logger.app_log.warning(f"Status: check_integrity method!!!")
     with sqlite3.connect(database) as ledger_check:
         ledger_check.text_factory = str
         l = ledger_check.cursor()
@@ -284,6 +285,7 @@ def check_integrity(database):
             redownload = True
 
     if redownload and node.is_mainnet:
+        logger.app_log.warning(f"Status: BOOTSTRAP disabled")
         bootstrap()
 
 
@@ -1713,7 +1715,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         db_handler_instance.execute(db_handler_instance.c,
                                                     "SELECT * FROM transactions WHERE reward != 0 ORDER BY block_height DESC LIMIT 1;")
                         block_last = db_handler_instance.c.fetchall()[0]
-
+                        logger.app_log.info(f"Status: NODE: blocklast={block_last}")
                         send(self.request, block_last)
                     else:
                         logger.app_log.info(f"{peer_ip} not whitelisted for blocklast command")

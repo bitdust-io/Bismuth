@@ -17,3 +17,12 @@ requests
 # These are no more used
 # pypng
 # pyinstaller
+
+
+pyinstaller
+flask
+pycryptodome
+simple-crypt
+PySocks
+requests
+tornado

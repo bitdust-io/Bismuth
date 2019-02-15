@@ -8,8 +8,9 @@ SLEN = 10
 def send(sdef, data, slen=SLEN):
     sdef.setblocking(1)
     # Make sure the packet is sent in one call
-
-    sdef.sendall(str(len(str(json.dumps(data)))).encode("utf-8").zfill(slen) + str(json.dumps(data)).encode("utf-8"))
+    data_ = str(len(str(json.dumps(data)))).encode("utf-8").zfill(slen) + str(json.dumps(data)).encode("utf-8")
+    sdef.sendall(data_)
+    print(f"CONNECTIONS.SEND: {data_.decode()}")
 
 if "Linux" in platform.system():
     READ_OR_ERROR = select.POLLIN | select.POLLPRI | select.POLLHUP | select.POLLERR | select.POLLNVAL

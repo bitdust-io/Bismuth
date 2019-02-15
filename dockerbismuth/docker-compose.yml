@@ -1,0 +1,52 @@
+version: "3"
+
+services:
+  _common_node:
+    build:
+      dockerfile: dockerbismuth/Dockerfile
+      context: ../
+    image: bismuth-node
+    entrypoint: ""
+    command: /bin/false
+
+  node1:
+    image: bismuth-node
+    command: ["python", "node.py"]
+    networks:
+      app_net:
+
+  node2:
+    image: bismuth-node
+    command: ["python", "node.py"]
+    networks:
+      app_net:
+
+  poolware:
+    image: bismuth-node
+    command: ["python", "optipoolware.py"]
+    volumes:
+      - ../:/code
+    networks:
+      app_net:
+
+  explorer:
+    image: bismuth-node
+    command: ["python", "optiexplorer.py"]
+    ports:
+      - 9080:9080
+    volumes:
+      - ../:/code
+    networks:
+      app_net:
+
+  miner:
+    image: bismuth-node
+    command: ["python", "optihash.py"]
+    volumes:
+      - ../:/code
+    networks:
+      app_net:
+
+networks:
+  app_net:
+    driver: bridge
