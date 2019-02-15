@@ -81,8 +81,8 @@ elif "regnet" in version:
     print("Regtest mode")
     s.connect (("127.0.0.1", 3030))
 else:
-    #s.connect(("127.0.0.1", 5658))
-    s.connect(("bismuth.live", 5658))
+    s.connect(("34.192.6.105", 5658))
+    #s.connect(("bismuth.live", 5658))
 
 def stop(socket):
     connections.send(s, "stop")
@@ -385,7 +385,6 @@ def api_getaddresssince(socket, arg1, arg2, arg3):
     connections.send(s, arg3)
     response = connections.receive(s)
     print(json.dumps(response))
-
 
 if command == "getversion":
     connections.send(s, "getversion")

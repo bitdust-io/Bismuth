@@ -35,12 +35,12 @@ def percentage_in(individual, whole):
 class Peers:
     """The peers manager. A thread safe peers manager"""
 
-    __slots__ = ('app_log','config','logstats','peersync_lock','startup_time','reset_time','warning_list','stats',
+    __slots__ = ('app_log','config','logstats','node','peersync_lock','startup_time','reset_time','warning_list','stats',
                  'connection_pool','peer_opinion_dict','consensus_percentage','consensus',
                  'tried','peer_dict','peerfile','suggested_peerfile','banlist','whitelist','ban_threshold',
                  'ip_to_mainnet', 'peers', 'consensus_lock', 'first_run', 'accept_peers')
 
-    def __init__(self, app_log, config=None, logstats=True):
+    def __init__(self, app_log, config=None, logstats=True, node=None):
         self.app_log = app_log
         self.config = config
         self.logstats = logstats
@@ -68,6 +68,8 @@ class Peers:
         self.peerfile = "peers.txt"
         self.suggested_peerfile = "suggested_peers.txt"
         self.first_run = True
+
+        self.node = node
 
         if self.is_testnet:  # overwrite for testnet
             self.peerfile = "peers_test.txt"
@@ -501,18 +503,19 @@ class Peers:
         for client in remove:
             del self.tried[client]
 
-    def manager_loop(self, target=None):
+    def client_loop(self, node, target):
         """Manager loop called every 30 sec. Handles maintenance"""
         try:
             for key, value in self.peer_dict.items():
                 host = key
                 port = int(value)
+
                 if self.is_testnet:
                     port = 2829
                 if threading.active_count()/3 < self.config.thread_limit_conf and self.can_connect_to(host, port):
                     self.app_log.info(f"Will attempt to connect to {host}:{port}")
                     self.add_try(host, port)
-                    t = threading.Thread(target=target, args=(host, port))  # threaded connectivity to nodes here
+                    t = threading.Thread(target=target, args=(host, port, node))  # threaded connectivity to nodes here
                     self.app_log.info(f"---Starting a client thread {threading.currentThread()} ---")
                     t.daemon = True
                     t.start()
@@ -545,7 +548,7 @@ class Peers:
                 self.reset_tried()
                 self.reset_time = time.time()
 
-            if self.first_run:
+            if self.first_run and int(time.time() - self.startup_time) > 90:
                 self.app_log.warning("Status: First run, testing peers")
                 self.peers_test(self.peerfile)
                 self.peers_test(self.suggested_peerfile)
@@ -563,14 +566,13 @@ class Peers:
 
     def status_log(self):
         """Prints the peers part of the node status"""
-        self.app_log.warning(f"Total number of known peers: {len(self.peer_dict)}")
         if self.banlist:
             self.app_log.warning(f"Status: Banlist: {self.banlist}")
             self.app_log.warning(f"Status: Banlist Count : {len(self.banlist)}")
         if self.whitelist:
             self.app_log.warning(f"Status: Whitelist: {self.whitelist}")
 
-        self.app_log.warning(f"Status: Peer dictionary: {self.peer_dict}")
+        self.app_log.warning(f"Status: Known Peers: {len(self.peer_dict)}")
         self.app_log.info(f"Status: Tried: {self.tried}")
         self.app_log.info(f"Status: Tried Count: {len(self.tried)}")
         self.app_log.info(f"Status: List of Outbound connections: {self.connection_pool}")

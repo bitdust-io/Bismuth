@@ -29,8 +29,9 @@ def vacuum(cursor, name):
     print(f"Vacuuming {name}")
     cursor.execute("VACUUM")
 
-def dupes_check(cursor, name):
-    print (f"Testing {name} for duplicates")
+
+def dupes_check_sigs(cursor, name):
+    print (f"Testing {name} for sig duplicates")
 
     cursor.execute("SELECT * FROM transactions WHERE signature IN (SELECT signature FROM transactions WHERE signature != '0' GROUP BY signature HAVING COUNT(*) >1)")
     results = cursor.fetchall()
@@ -42,7 +43,24 @@ def dupes_check(cursor, name):
             print (f"Duplicate entry on block: {result}")
             tar_obj.errors += 1
 
+def dupes_check_rows_transactions(cursor, name):
+    print (f"Testing {name} for transaction row duplicates")
 
+    cursor.execute("SELECT block_height, timestamp, address, recipient, amount, signature, public_key, block_hash, fee, reward, operation, openfield, COUNT(*) FROM transactions GROUP BY block_height, timestamp, address, recipient, amount, signature, public_key, block_hash, fee, reward, operation, openfield HAVING COUNT(*) > 1")
+    result = cursor.fetchall()
+    for entry in result:
+        print(f"Duplicate entry on block: {entry}")
+        tar_obj.errors += 1
+
+
+def dupes_check_rows_misc(cursor, name):
+    print (f"Testing {name} for misc row duplicates")
+
+    cursor.execute("SELECT block_height, difficulty, COUNT(*) FROM misc GROUP BY block_height, difficulty HAVING COUNT(*) > 1")
+    result = cursor.fetchall()
+    for entry in result:
+        print(f"Duplicate entry on block: {entry}")
+        tar_obj.errors += 1
 
 def balance_from_cursor(cursor, address):
     credit = Decimal("0")
@@ -70,7 +88,7 @@ def balance_from_cursor(cursor, address):
 
     return quantize_eight(credit-debit)
 
-def balance_differences ():
+def balance_differences():
     
     print ("Selecting all addresses from full ledger for errors")
     tar_obj.h.execute ("SELECT distinct(recipient) FROM transactions group by recipient;")
@@ -98,27 +116,25 @@ def balance_differences ():
 
     print(f"Done, {tar_obj.errors} errors.")
 
-    if tar_obj.errors > 0:
-        return_value = True
-    else:
-        return_value = False
-
-    return return_value
-
-
-dupes_check(tar_obj.h, tar_obj.h_name)
-dupes_check(tar_obj.h2, tar_obj.h2_name)
 balance_differences()
-vacuum(tar_obj.h, tar_obj.h_name)
-vacuum(tar_obj.h2, tar_obj.h2_name)
+dupes_check_rows_transactions(tar_obj.h, tar_obj.h_name)
+dupes_check_rows_transactions(tar_obj.h2, tar_obj.h2_name)
+dupes_check_rows_misc(tar_obj.h, tar_obj.h_name)
+dupes_check_rows_misc(tar_obj.h2, tar_obj.h2_name)
+dupes_check_sigs(tar_obj.h, tar_obj.h_name)
+dupes_check_sigs(tar_obj.h2, tar_obj.h2_name)
 
-tar_obj.hdd.close()
-tar_obj.hdd2.close()
 
 if tar_obj.errors > 0:
     print("There were errors, cannot continue")
+    tar_obj.hdd.close()
+    tar_obj.hdd2.close()
     
 else:
+    vacuum(tar_obj.h, tar_obj.h_name)
+    vacuum(tar_obj.h2, tar_obj.h2_name)
+    tar_obj.hdd.close()
+    tar_obj.hdd2.close()
 
     if not process_search.proccess_presence ("node.py"):
         files = ["ledger.db-wal","ledger.db-shm","ledger.db","hyper.db-shm", "hyper.db-wal", "hyper.db", "index.db"]

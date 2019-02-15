@@ -12,7 +12,8 @@
 # issues with db? perhaps you missed a commit() or two
 
 
-VERSION = "4.2.9.1"  # 3. regnet support
+app_version = "4.2.9.2"
+VERSION = app_version #compat hypernodes
 
 import base64
 import glob
@@ -54,18 +55,20 @@ import plugins
 import regnet
 import staking
 import tokensv2 as tokens
-from essentials import fee_calculate
+from essentials import fee_calculate, db_to_drive, ledger_balance3, checkpoint_set
 from quantizer import *
+import connectionmanager
+from difficulty import *
+from fork import *
+from digest import *
 
 # load config
 
-POW_FORK = 854660
-FORK_AHEAD = 5
-FORK_DIFF = 108.9
+
 
 getcontext().rounding = ROUND_HALF_EVEN
+POW_FORK, FORK_AHEAD, FORK_DIFF = fork()
 
-db_lock = threading.Lock()
 
 from appdirs import *
 
@@ -82,24 +85,7 @@ def replace_regex(string, replace):
     replaced_string = re.sub(r'^{}'.format(replace), "", string)
     return replaced_string
 
-
-def round_down(number, order):
-    return int(math.floor(number / order)) * order
-
-
-def checkpoint_set(block_reference):
-    if block_reference > 2000:
-        node.checkpoint = round_down(block_reference, 1000) - 1000
-        logger.app_log.warning(f"Checkpoint set to {node.checkpoint}")
-
-
-def limit_version():
-    if 'mainnet0018' in node.version_allow:
-        logger.app_log.warning(f"Beginning to reject mainnet0018 - block {node.last_block}")
-        node.version_allow.remove('mainnet0018')
-
-
-def tokens_rollback(height, db_handler):
+def tokens_rollback(node, height, db_handler):
     """Rollback Token index
 
     :param height: height index of token in chain
@@ -110,15 +96,15 @@ def tokens_rollback(height, db_handler):
     returns None
     """
     try:
-        db_handler.execute_param(db_handler.index_cursor, "DELETE FROM tokens WHERE block_height >= ?;", (height - 1,))
+        db_handler.execute_param(db_handler.index_cursor, "DELETE FROM tokens WHERE block_height >= ?;", (height,))
         db_handler.commit(db_handler.index)
 
-        logger.app_log.warning(f"Rolled back the token index to {(height - 1)}")
+        node.logger.app_log.warning(f"Rolled back the token index below {(height)}")
     except Exception as e:
-        logger.app_log.warning(f"Failed to roll back the token index to {(height - 1)} due to {e}")
+        node.logger.app_log.warning(f"Failed to roll back the token index below {(height)} due to {e}")
 
 
-def staking_rollback(height, db_handler):
+def staking_rollback(node, height, db_handler):
     """Rollback staking index
 
     :param height: height index of token in chain
@@ -129,15 +115,15 @@ def staking_rollback(height, db_handler):
     returns None
     """
     try:
-        db_handler.execute_param(db_handler.index_cursor, "DELETE FROM staking WHERE block_height >= ?;", (height - 1,))
+        db_handler.execute_param(db_handler.index_cursor, "DELETE FROM staking WHERE block_height >= ?;", (height,))
         db_handler.commit(db_handler.index)
 
-        logger.app_log.warning(f"Rolled back the staking index to {(height - 1)}")
+        node.logger.app_log.warning(f"Rolled back the staking index below {(height)}")
     except Exception as e:
-        logger.app_log.warning(f"Failed to roll back the staking index to {(height - 1)} due to {e}")
+        node.logger.app_log.warning(f"Failed to roll back the staking index below {(height)} due to {e}")
 
 
-def aliases_rollback(height, db_handler):
+def aliases_rollback(node, height, db_handler):
     """Rollback Alias index
 
     :param height: height index of token in chain
@@ -148,43 +134,14 @@ def aliases_rollback(height, db_handler):
     returns None
     """
     try:
-        db_handler.execute_param(db_handler.index_cursor, "DELETE FROM aliases WHERE block_height >= ?;", (height - 1,))
+        db_handler.execute_param(db_handler.index_cursor, "DELETE FROM aliases WHERE block_height >= ?;", (height,))
         db_handler.commit(db_handler.index)
 
-        logger.app_log.warning(f"Rolled back the alias index to {(height - 1)}")
+        node.logger.app_log.warning(f"Rolled back the alias index below {(height)}")
     except Exception as e:
-        logger.app_log.warning(f"Failed to roll back the alias index to {(height - 1)} due to {e}")
+        node.logger.app_log.warning(f"Failed to roll back the alias index below {(height)} due to {e}")
 
 
-def sendsync(sdef, peer_ip, status, provider):
-    """ Save peer_ip to peerlist and send `sendsync`
-
-    :param sdef: socket object
-    :param peer_ip: IP of peer synchronization has been completed with
-    :param status: Status synchronization was completed in/as
-    :param provider: Provided a valid block
-
-    Log the synchronization status
-    Save peer IP to peers list if applicable
-    Wait for database to unlock
-    Send `sendsync` command via socket `sdef`
-
-    returns None
-    """
-
-    logger.app_log.info(f"Outbound: Synchronization with {peer_ip} finished after: {status}, sending new sync request")
-
-    if provider:
-        logger.app_log.info(f"Outbound: Saving peer {peer_ip}")
-        node.peers.peer_dump(node.peerfile, peer_ip)
-
-    time.sleep(Decimal(node.pause_conf))
-    while db_lock.locked():
-        if node.IS_STOPPING:
-            return
-        time.sleep(Decimal(node.pause_conf))
-
-    send(sdef, "sendsync")
 
 
 def validate_pem(public_key):
@@ -262,7 +219,7 @@ def bootstrap():
             tar.extractall("static/")  # NOT COMPATIBLE WITH CUSTOM PATH CONFS
 
     except:
-        logger.app_log.warning("Something went wrong during bootstrapping, aborted")
+        node.logger.app_log.warning("Something went wrong during bootstrapping, aborted")
         raise
 
 
@@ -280,7 +237,7 @@ def check_integrity(database):
             redownload = True
 
         if len(l.fetchall()) != 12:
-            logger.app_log.warning(
+            node.logger.app_log.warning(
                 f"Status: Integrity check on database {database} failed, bootstrapping from the website")
             redownload = True
 
@@ -292,188 +249,165 @@ def check_integrity(database):
 def percentage(percent, whole):
     return Decimal(percent) * Decimal(whole) / 100
 
+def rollback_to(node, db_handler, block_height):
+    node.logger.app_log.warning(f"Status: Rolling back below: {block_height}")
 
-def db_to_drive(db_handler):
-    db_handler.ram_connect()
-    logger.app_log.warning("Chain: Moving new data to HDD")
-    try:
+    db_handler.h.execute("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (block_height,-block_height,))
+    db_handler.commit(db_handler.hdd)
+    db_handler.h.execute("DELETE FROM misc WHERE block_height >= ?", (block_height,))
+    db_handler.commit(db_handler.hdd)
 
-        db_handler.execute_param(db_handler.sc, (
-            "SELECT * FROM transactions WHERE block_height > ? OR block_height < ? ORDER BY block_height ASC"),
-                                 (node.hdd_block, -node.hdd_block))
+    db_handler.h2.execute("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (block_height, -block_height,))
+    db_handler.commit(db_handler.hdd2)
+    db_handler.h2.execute("DELETE FROM misc WHERE block_height >= ?", (block_height,))
+    db_handler.commit(db_handler.hdd2)
 
-        result1 = db_handler.sc.fetchall()
+    # rollback indices
+    tokens_rollback(node, block_height, db_handler)
+    aliases_rollback(node, block_height, db_handler)
+    staking_rollback(node, block_height, db_handler)
+    # rollback indices
 
-        if node.full_ledger:  # we want to save to ledger.db
-            db_handler.execute_many(db_handler.h, "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", result1)
-            db_handler.commit(db_handler.hdd)
-
-        if node.ram_conf:  # we want to save to hyper.db from RAM/hyper.db depending on ram conf
-            db_handler.execute_many(db_handler.h2, "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", result1)
-            db_handler.commit(db_handler.hdd2)
-
-        db_handler.execute_param(db_handler.sc, "SELECT * FROM misc WHERE block_height > ? ORDER BY block_height ASC", (node.hdd_block,))
-        result2 = db_handler.sc.fetchall()
-
-        if node.full_ledger:  # we want to save to ledger.db from RAM/hyper.db depending on ram conf
-            db_handler.execute_many(db_handler.h, "INSERT INTO misc VALUES (?,?)", result2)
-            db_handler.commit(db_handler.hdd)
-
-        if node.ram_conf:  # we want to save to hyper.db from RAM
-            db_handler.execute_many(db_handler.h2, "INSERT INTO misc VALUES (?,?)", result2)
-            db_handler.commit(db_handler.hdd2)
-
-        db_handler.execute(db_handler.h2, "SELECT max(block_height) FROM transactions")
-        node.hdd_block = db_handler.h2.fetchone()[0]
-
-        logger.app_log.warning(f"Chain: {len(result1)} txs moved to HDD")
-    except Exception as e:
-        logger.app_log.warning(f"Chain: Exception Moving new data to HDD: {e}")
-        # app_log.warning("Ledger digestion ended")  # dup with more informative digest_block notice.
-    finally:
-        db_handler.ram_close()
+    node.logger.app_log.warning(f"Status: Chain rolled back below {block_height} and will be resynchronized")
 
 
-def ledger_compress():
-    local_ledger_path_conf = node.ledger_path_conf
-    local_hyper_path_conf = node.hyper_path_conf
+def recompress_ledger(node, rebuild=False, depth=15000):
 
+    files_remove = [node.ledger_path_conf + '.temp',node.ledger_path_conf + '.temp-shm',node.ledger_path_conf + '.temp-wal']
+    for file in files_remove:
+        if os.path.exists(file):
+            os.remove(file)
+            node.logger.app_log.warning(f"Removed old {file}")
+
+    if node.full_ledger and rebuild:
+        node.logger.app_log.warning(f"Status: Hyperblocks will be rebuilt")
+
+        shutil.copy(node.ledger_path_conf, node.ledger_path_conf + '.temp')
+        hyper = sqlite3.connect(node.ledger_path_conf + '.temp')
+    else:
+        shutil.copy(node.hyper_path_conf, node.ledger_path_conf + '.temp')
+        hyper = sqlite3.connect(node.ledger_path_conf + '.temp')
+
+    hyper.text_factory = str
+    hyp = hyper.cursor()
+
+    hyp.execute("UPDATE transactions SET address = 'Hypoblock' WHERE address = 'Hyperblock'")
+
+    hyp.execute("SELECT max(block_height) FROM transactions")
+    db_block_height = int(hyp.fetchone()[0])
+    depth_specific = db_block_height - depth
+
+    hyp.execute(
+        "SELECT distinct(recipient) FROM transactions WHERE (block_height < ? AND block_height > ?) ORDER BY block_height;",
+        (depth_specific, -depth_specific,))  # new addresses will be ignored until depth passed
+    unique_addressess = hyp.fetchall()
+
+    for x in set(unique_addressess):
+        credit = Decimal("0")
+        for entry in hyp.execute(
+                "SELECT amount,reward FROM transactions WHERE recipient = ? AND (block_height < ? AND block_height > ?);",
+                (x[0],) + (depth_specific, -depth_specific,)):
+            try:
+                credit = quantize_eight(credit) + quantize_eight(entry[0]) + quantize_eight(entry[1])
+                credit = 0 if credit is None else credit
+            except Exception:
+                credit = 0
+
+        debit = Decimal("0")
+        for entry in hyp.execute(
+                "SELECT amount,fee FROM transactions WHERE address = ? AND (block_height < ? AND block_height > ?);",
+                (x[0],) + (depth_specific, -depth_specific,)):
+            try:
+                debit = quantize_eight(debit) + quantize_eight(entry[0]) + quantize_eight(entry[1])
+                debit = 0 if debit is None else debit
+            except Exception:
+                debit = 0
+
+        end_balance = quantize_eight(credit - debit)
+
+        if end_balance > 0:
+            timestamp = str(time.time())
+            hyp.execute("INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                depth_specific - 1, timestamp, "Hyperblock", x[0], str(end_balance), "0", "0", "0", "0",
+                "0", "0", "0"))
+    hyper.commit()
+
+    hyp.execute(
+        "DELETE FROM transactions WHERE address != 'Hyperblock' AND (block_height < ? AND block_height > ?);",
+        (depth_specific, -depth_specific,))
+    hyper.commit()
+
+    hyp.execute("DELETE FROM misc WHERE (block_height < ? AND block_height > ?);",
+                (depth_specific, -depth_specific,))  # remove diff calc
+    hyper.commit()
+
+    hyp.execute("VACUUM")
+    hyper.close()
+
+
+    if os.path.exists(node.hyper_path_conf) and rebuild:
+        os.remove(node.hyper_path_conf)  # remove the old hyperblocks to rebuild
+        os.rename(node.ledger_path_conf + '.temp', node.hyper_path_conf)
+
+    if node.full_ledger == 0 and os.path.exists(node.ledger_path_conf) and node.is_mainnet:
+        os.remove(node.ledger_path_conf)
+        node.logger.app_log.warning("Removed full ledger and only kept hyperblocks")
+
+
+
+
+def ledger_check_heights(node, db_handler):
     """conversion of normal blocks into hyperblocks from ledger.db or hyper.db to hyper.db"""
-    try:
 
-        # if os.path.exists(node.hyper_path_conf+".temp"):
-        #    os.remove(node.hyper_path_conf+".temp")
-        #    logger.app_log.warning("Status: Removed old temporary hyperblock file")
-        #    time.sleep(100)
+    if os.path.exists(node.hyper_path_conf):
 
-        if os.path.exists(node.hyper_path_conf):
+        if node.full_ledger:
+            # cross-integrity check
+            db_handler.h.execute("SELECT max(block_height) FROM transactions")
+            hdd_block_last = db_handler.h.fetchone()[0]
+            db_handler.h.execute("SELECT max(block_height) FROM misc")
+            hdd_block_last_misc = db_handler.h.fetchone()[0]
 
-            if node.full_ledger:
-                # cross-integrity check
-                local_hdd = sqlite3.connect(node.ledger_path_conf, timeout=1)
-                local_hdd.text_factory = str
-                local_h = local_hdd.cursor()
-                local_h.execute("SELECT max(block_height) FROM transactions")
-                local_hdd_block_last = local_h.fetchone()[0]
-                local_hdd.close()
+            db_handler.h2.execute("SELECT max(block_height) FROM transactions")
+            hdd2_block_last = db_handler.h2.fetchone()[0]
+            db_handler.h2.execute("SELECT max(block_height) FROM misc")
+            hdd2_block_last_misc = db_handler.h2.fetchone()[0]
+            # cross-integrity check
 
-                local_hdd2 = sqlite3.connect(node.hyper_path_conf, timeout=1)
-                local_hdd2.text_factory = str
-                local_h2 = local_hdd2.cursor()
-                local_h2.execute("SELECT max(block_height) FROM transactions")
-                local_hdd2_block_last = local_h2.fetchone()[0]
-                local_hdd2.close()
-                # cross-integrity check
-
-                if local_hdd_block_last == local_hdd2_block_last and node.hyper_recompress_conf:  # cross-integrity check
-                    local_ledger_path_conf = local_hyper_path_conf  # only valid within the function, this temporarily sets hyper.db as source
-                    logger.app_log.warning("Status: Recompressing hyperblocks (keeping full ledger)")
-                    recompress = True
-                elif local_hdd_block_last == local_hdd2_block_last and not node.hyper_recompress_conf:
-                    logger.app_log.warning("Status: Hyperblock recompression skipped")
-                    recompress = False
-                else:
-                    logger.app_log.warning(
-                        f"Status: Cross-integrity check failed {local_hdd_block_last} not equal to {local_hdd2_block_last}, hyperblocks will be rebuilt from full ledger")
-                    recompress = True
+            if hdd_block_last == hdd2_block_last == hdd2_block_last_misc == hdd_block_last_misc and node.hyper_recompress_conf:  # cross-integrity check
+                node.logger.app_log.warning("Status: Recompressing hyperblocks (keeping full ledger)")
+                recompress = True
+            elif hdd_block_last == hdd2_block_last and not node.hyper_recompress_conf:
+                node.logger.app_log.warning("Status: Hyperblock recompression skipped")
+                recompress = False
             else:
-                if node.hyper_recompress_conf:
-                    logger.app_log.warning("Status: Recompressing hyperblocks (without full ledger)")
-                    recompress = True
-                else:
-                    logger.app_log.warning("Status: Hyperblock recompression skipped")
-                    recompress = False
+                lowest_block = min(hdd_block_last, hdd2_block_last, hdd_block_last_misc, hdd2_block_last_misc)
+                highest_block = max(hdd_block_last, hdd2_block_last, hdd_block_last_misc, hdd2_block_last_misc)
 
+
+                node.logger.app_log.warning(
+                    f"Status: Cross-integrity check failed, {highest_block} will be rolled back below {lowest_block}")
+
+                rollback_to(node,db_handler_initial,lowest_block) #rollback to the lowest value
+
+                recompress = True
         else:
-            logger.app_log.warning("Status: Compressing ledger to Hyperblocks")
-            recompress = True
-
-        if recompress:
-            depth = 15000  # REWORK TO REFLECT TIME INSTEAD OF BLOCKS
-
-            if node.full_ledger:
-                shutil.copy(local_ledger_path_conf, local_ledger_path_conf + '.temp')
-                hyper = sqlite3.connect(local_ledger_path_conf + '.temp')
+            if node.hyper_recompress_conf:
+                node.logger.app_log.warning("Status: Recompressing hyperblocks (without full ledger)")
+                recompress = True
             else:
-                shutil.copy(local_hyper_path_conf, local_ledger_path_conf + '.temp')
-                hyper = sqlite3.connect(local_ledger_path_conf + '.temp')
+                node.logger.app_log.warning("Status: Hyperblock recompression skipped")
+                recompress = False
 
-            hyper.text_factory = str
-            hyp = hyper.cursor()
+    else:
+        node.logger.app_log.warning("Status: Compressing ledger to Hyperblocks")
+        recompress = True
 
-            hyp.execute("UPDATE transactions SET address = 'Hypoblock' WHERE address = 'Hyperblock'")
+    if recompress:
+        recompress_ledger(node)
 
-            hyp.execute("SELECT max(block_height) FROM transactions")
-            db_block_height = int(hyp.fetchone()[0])
-            depth_specific = db_block_height - depth
 
-            hyp.execute(
-                "SELECT distinct(recipient) FROM transactions WHERE (block_height < ? AND block_height > ?) ORDER BY block_height;",
-                (depth_specific, -depth_specific,))  # new addresses will be ignored until depth passed
-            unique_addressess = hyp.fetchall()
 
-            for x in set(unique_addressess):
-                credit = Decimal("0")
-                for entry in hyp.execute(
-                        "SELECT amount,reward FROM transactions WHERE recipient = ? AND (block_height < ? AND block_height > ?);",
-                        (x[0],) + (depth_specific, -depth_specific,)):
-                    try:
-                        credit = quantize_eight(credit) + quantize_eight(entry[0]) + quantize_eight(entry[1])
-                        credit = 0 if credit is None else credit
-                    except Exception:
-                        credit = 0
-
-                debit = Decimal("0")
-                for entry in hyp.execute(
-                        "SELECT amount,fee FROM transactions WHERE address = ? AND (block_height < ? AND block_height > ?);",
-                        (x[0],) + (depth_specific, -depth_specific,)):
-                    try:
-                        debit = quantize_eight(debit) + quantize_eight(entry[0]) + quantize_eight(entry[1])
-                        debit = 0 if debit is None else debit
-                    except Exception:
-                        debit = 0
-
-                end_balance = quantize_eight(credit - debit)
-
-                # logger.app_log.info("Address: "+ str(x))
-                # logger.app_log.info("Credit: " + str(credit))
-                # logger.app_log.info("Debit: " + str(debit))
-                # logger.app_log.info("Fees: " + str(fees))
-                # logger.app_log.info("Rewards: " + str(rewards))
-                # logger.app_log.info("Balance: " + str(end_balance))
-
-                # print(x[0],end_balance)
-
-                if end_balance > 0:
-                    timestamp = str(time.time())
-                    hyp.execute("INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
-                        depth_specific - 1, timestamp, "Hyperblock", x[0], str(end_balance), "0", "0", "0", "0",
-                        "0", "0", "0"))
-            hyper.commit()
-
-            hyp.execute(
-                "DELETE FROM transactions WHERE address != 'Hyperblock' AND (block_height < ? AND block_height > ?);",
-                (depth_specific, -depth_specific,))
-            hyper.commit()
-
-            hyp.execute("DELETE FROM misc WHERE (block_height < ? AND block_height > ?);",
-                        (depth_specific, -depth_specific,))  # remove diff calc
-            hyper.commit()
-
-            hyp.execute("VACUUM")
-            hyper.close()
-
-            if os.path.exists(node.hyper_path_conf):
-                os.remove(node.hyper_path_conf)  # remove the old hyperblocks
-
-            os.rename(local_ledger_path_conf + '.temp', local_hyper_path_conf)
-
-        if node.full_ledger == 0 and os.path.exists(local_ledger_path_conf) and node.is_mainnet:
-            os.remove(local_ledger_path_conf)
-            logger.app_log.warning("Removed full ledger and only kept hyperblocks")
-
-    except Exception as e:
-        raise ValueError(f"There was an issue converting to Hyperblocks: {e}")
 
 
 def most_common(lst):
@@ -484,96 +418,13 @@ def bin_convert(string):
     return ''.join(format(ord(x), '8b').replace(' ', '0') for x in string)
 
 
-def difficulty(db_handler):
-    db_handler.execute(db_handler.c, "SELECT * FROM transactions WHERE reward != 0 ORDER BY block_height DESC LIMIT 2")
-    result = db_handler.c.fetchone()
-
-    timestamp_last = Decimal(result[1])
-    block_height = int(result[0])
-    node.last_block = block_height
-
-    previous = db_handler.c.fetchone()
-
-    node.last_block_ago = int(time.time() - int(timestamp_last))
-
-    # Failsafe for regtest starting at block 1}
-    timestamp_before_last = timestamp_last if previous is None else Decimal(previous[1])
-
-    db_handler.execute_param(db_handler.c, (
-        "SELECT timestamp FROM transactions WHERE block_height > ? AND reward != 0 ORDER BY timestamp ASC LIMIT 2"),
-                             (block_height - 1441,))
-    timestamp_1441 = Decimal(db_handler.c.fetchone()[0])
-    block_time_prev = (timestamp_before_last - timestamp_1441) / 1440
-    temp = db_handler.c.fetchone()
-    timestamp_1440 = timestamp_1441 if temp is None else Decimal(temp[0])
-    block_time = Decimal(timestamp_last - timestamp_1440) / 1440
-    db_handler.execute(db_handler.c, "SELECT difficulty FROM misc ORDER BY block_height DESC LIMIT 1")
-    diff_block_previous = Decimal(db_handler.c.fetchone()[0])
-
-    time_to_generate = timestamp_last - timestamp_before_last
-
-    if node.is_regnet:
-        return (float('%.10f' % regnet.REGNET_DIFF), float('%.10f' % (regnet.REGNET_DIFF - 8)), float(time_to_generate),
-                float(regnet.REGNET_DIFF), float(block_time), float(0), float(0), block_height)
-
-    hashrate = pow(2, diff_block_previous / Decimal(2.0)) / (
-            block_time * math.ceil(28 - diff_block_previous / Decimal(16.0)))
-    # Calculate new difficulty for desired blocktime of 60 seconds
-    target = Decimal(60.00)
-    ##D0 = diff_block_previous
-    difficulty_new = Decimal(
-        (2 / math.log(2)) * math.log(hashrate * target * math.ceil(28 - diff_block_previous / Decimal(16.0))))
-    # Feedback controller
-    Kd = 10
-    difficulty_new = difficulty_new - Kd * (block_time - block_time_prev)
-    diff_adjustment = (difficulty_new - diff_block_previous) / 720  # reduce by factor of 720
-
-    if diff_adjustment > Decimal(1.0):
-        diff_adjustment = Decimal(1.0)
-
-    difficulty_new_adjusted = quantize_ten(diff_block_previous + diff_adjustment)
-    difficulty = difficulty_new_adjusted
-
-    if node.is_mainnet:
-        if block_height == POW_FORK - FORK_AHEAD:
-            limit_version()
-        if block_height == POW_FORK - 1:
-            difficulty = FORK_DIFF
-        if block_height == POW_FORK:
-            difficulty = FORK_DIFF
-            # Remove mainnet0018 from allowed
-            limit_version()
-            # disconnect our outgoing connections
-
-    diff_drop_time = Decimal(180)
-
-    if Decimal(time.time()) > Decimal(timestamp_last) + Decimal(2 * diff_drop_time):
-        # Emergency diff drop
-        time_difference = quantize_two(time.time()) - quantize_two(timestamp_last)
-        diff_dropped = quantize_ten(difficulty) - quantize_ten(1) \
-                       - quantize_ten(10 * (time_difference - 2 * diff_drop_time) / diff_drop_time)
-    elif Decimal(time.time()) > Decimal(timestamp_last) + Decimal(diff_drop_time):
-        time_difference = quantize_two(time.time()) - quantize_two(timestamp_last)
-        diff_dropped = quantize_ten(difficulty) + quantize_ten(1) - quantize_ten(time_difference / diff_drop_time)
-    else:
-        diff_dropped = difficulty
-
-    if difficulty < 50:
-        difficulty = 50
-    if diff_dropped < 50:
-        diff_dropped = 50
-
-    return (
-        float('%.10f' % difficulty), float('%.10f' % diff_dropped), float(time_to_generate), float(diff_block_previous),
-        float(block_time), float(hashrate), float(diff_adjustment),
-        block_height)  # need to keep float here for database inserts support
 
 
 def balanceget(balance_address, db_handler):
     # verify balance
 
-    # logger.app_log.info("Mempool: Verifying balance")
-    # logger.app_log.info("Mempool: Received address: " + str(balance_address))
+    # node.logger.app_log.info("Mempool: Verifying balance")
+    # node.logger.app_log.info("Mempool: Received address: " + str(balance_address))
 
     base_mempool = mp.MEMPOOL.fetchall("SELECT amount, openfield, operation FROM transactions WHERE address = ?;",
                                        (balance_address,))
@@ -647,17 +498,17 @@ def balanceget(balance_address, db_handler):
 
     balance = quantize_eight(credit_ledger - debit - fees + rewards)
     balance_no_mempool = float(credit_ledger) - float(debit_ledger) - float(fees) + float(rewards)
-    # logger.app_log.info("Mempool: Projected transction address balance: " + str(balance))
+    # node.logger.app_log.info("Mempool: Projected transction address balance: " + str(balance))
     return str(balance), str(credit_ledger), str(debit), str(fees), str(rewards), str(balance_no_mempool)
 
 
-def blocknf(block_hash_delete, peer_ip, db_handler):
-    logger.app_log.info(f"Rollback operation on {block_hash_delete} initiated by {peer_ip}")
+def blocknf(node, block_hash_delete, peer_ip, db_handler):
+    node.logger.app_log.info(f"Rollback operation on {block_hash_delete} initiated by {peer_ip}")
 
     my_time = time.time()
 
-    if not db_lock.locked():
-        db_lock.acquire()
+    if not node.db_lock.locked():
+        node.db_lock.acquire()
         backup_data = None  # used in "finally" section
         skip = False
         reason = ""
@@ -697,7 +548,7 @@ def blocknf(block_hash_delete, peer_ip, db_handler):
                 db_handler.execute_param(db_handler.c, "DELETE FROM misc WHERE block_height >= ?;", (db_block_height,))
                 db_handler.commit(db_handler.conn)
 
-                logger.app_log.warning(f"Node {peer_ip} didn't find block {db_block_height}({db_block_hash})")
+                node.logger.app_log.warning(f"Node {peer_ip} didn't find block {db_block_height}({db_block_hash})")
 
                 # roll back hdd too
                 if node.full_ledger:  # rollback ledger.db
@@ -718,21 +569,22 @@ def blocknf(block_hash_delete, peer_ip, db_handler):
                 # /roll back hdd too
 
                 # rollback indices
-                tokens_rollback(db_block_height, db_handler)
-                aliases_rollback(db_block_height, db_handler)
-                staking_rollback(db_block_height, db_handler)
+                tokens_rollback(node, db_block_height, db_handler)
+                aliases_rollback(node, db_block_height, db_handler)
+                staking_rollback(node, db_block_height, db_handler)
                 # /rollback indices
 
         except Exception as e:
-            logger.app_log.warning(e)
+            node.logger.app_log.warning(e)
+
 
         finally:
-            db_lock.release()
+            node.db_lock.release()
             if skip:
                 rollback = {"timestamp": my_time, "height": db_block_height, "ip": peer_ip,
                             "sha_hash": db_block_hash, "skipped": True, "reason": reason}
                 node.plugin_manager.execute_action_hook('rollback', rollback)
-                logger.app_log.info(f"Skipping rollback: {reason}")
+                node.logger.app_log.info(f"Skipping rollback: {reason}")
             else:
                 try:
                     nb_tx = 0
@@ -741,12 +593,12 @@ def blocknf(block_hash_delete, peer_ip, db_handler):
                         if tx[9] == 0:
                             try:
                                 nb_tx += 1
-                                logger.app_log.info(
+                                node.logger.app_log.info(
                                     mp.MEMPOOL.merge((tx[1], tx[2], tx[3], tx[4], tx[5], tx[6], tx[10], tx[11]),
-                                                     peer_ip, db_handler.c, False, revert=True))  # will get stuck if you change it to respect db_lock
-                                logger.app_log.warning(f"Moved tx back to mempool: {tx_short}")
+                                                     peer_ip, db_handler.c, False, revert=True))  # will get stuck if you change it to respect node.db_lock
+                                node.logger.app_log.warning(f"Moved tx back to mempool: {tx_short}")
                             except Exception as e:
-                                logger.app_log.warning(f"Error during moving tx back to mempool: {e}")
+                                node.logger.app_log.warning(f"Error during moving tx back to mempool: {e}")
                         else:
                             # It's the coinbase tx, so we get the miner address
                             miner = tx[3]
@@ -756,503 +608,24 @@ def blocknf(block_hash_delete, peer_ip, db_handler):
                     node.plugin_manager.execute_action_hook('rollback', rollback)
 
                 except Exception as e:
-                    logger.app_log.warning(f"Error during moving txs back to mempool: {e}")
+                    node.logger.app_log.warning(f"Error during moving txs back to mempool: {e}")
 
     else:
         reason = "Skipping rollback, other ledger operation in progress"
         rollback = {"timestamp": my_time, "ip": peer_ip, "skipped": True, "reason": reason}
         node.plugin_manager.execute_action_hook('rollback', rollback)
-        logger.app_log.info(reason)
+        node.logger.app_log.info(reason)
 
-
-def manager():
-    # moved to peershandler
-    # reset_time = node.startup_time
-    # peers_test("peers.txt")
-    # peers_test("suggested_peers.txt")
-
-    until_purge = 0
-
-    while not node.IS_STOPPING:
-        # dict_keys = peer_dict.keys()
-        # random.shuffle(peer_dict.items())
-        if until_purge == 0:
-            # will purge once at start, then about every hour (120 * 30 sec)
-            mp.MEMPOOL.purge()
-            until_purge = 120
-
-        until_purge -= 1
-
-        # peer management
-        if not node.is_regnet:
-            # regnet never tries to connect
-            node.peers.manager_loop(target=worker)
-
-        logger.app_log.warning(f"Status: Threads at {threading.active_count()} / {node.thread_limit_conf}")
-        logger.app_log.info(f"Status: Syncing nodes: {node.syncing}")
-        logger.app_log.info(f"Status: Syncing nodes: {len(node.syncing)}/3")
-
-        # Status display for Peers related info
-        node.peers.status_log()
-        mp.MEMPOOL.status()
-
-        if node.last_block_ago:
-            node.last_block_ago = time.time() - int(node.last_block_timestamp)
-            logger.app_log.warning(f"Status: Last block {node.last_block} was generated {'%.2f' % (node.last_block_ago / 60) } minutes ago")
-        # last block
-        # status Hook
-        uptime = int(time.time() - node.startup_time)
-
-        status = {"protocolversion": node.version, "walletversion": VERSION, "testnet": node.is_testnet,
-                  # config data
-                  "blocks": node.last_block, "timeoffset": 0, "connections": node.peers.consensus_size,
-                  "difficulty": node.difficulty[0],  # live status, bitcoind format
-                  "threads": threading.active_count(), "uptime": uptime, "consensus": node.peers.consensus,
-                  "consensus_percent": node.peers.consensus_percentage,
-                  "last_block_ago": node.last_block_ago}  # extra data
-        if node.is_regnet:
-            status['regnet'] = True
-        node.plugin_manager.execute_action_hook('status', status)
-        # end status hook
-
-        if node.peerfile_suggested:  # if it is not empty
-            try:
-                node.peers.peers_dump(node.peerfile_suggested, node.peers.peer_dict)
-            except Exception as e:
-                logger.app_log.warning(f"There was an issue saving peers ({e}), skipped")
-                pass
-
-        # logger.app_log.info(threading.enumerate() all threads)
-        for i in range(30):
-            # faster stop
-            if not node.IS_STOPPING:
-                time.sleep(1)
-
-
-def ledger_balance3(address, cache, db_handler):
-    # Many heavy blocks are pool payouts, same address.
-    # Cache pre_balance instead of recalc for every tx
-    if address in cache:
-        return cache[address]
-    credit_ledger = Decimal(0)
-
-    db_handler.execute_param(db_handler.c, "SELECT amount, reward FROM transactions WHERE recipient = ?;", (address,))
-    entries = db_handler.c.fetchall()
-
-    for entry in entries:
-        credit_ledger += quantize_eight(entry[0]) + quantize_eight(entry[1])
-
-    debit_ledger = Decimal(0)
-    db_handler.execute_param(db_handler.c, "SELECT amount, fee FROM transactions WHERE address = ?;", (address,))
-    entries = db_handler.c.fetchall()
-
-    for entry in entries:
-        debit_ledger += quantize_eight(entry[0]) + quantize_eight(entry[1])
-
-    cache[address] = quantize_eight(credit_ledger - debit_ledger)
-    return cache[address]
-
-
-def digest_block(data, sdef, peer_ip, db_handler):
-    block_height_new = node.last_block + 1  # for logging purposes.
-    block_hash = 'N/A'
-    failed_cause = ''
-    block_count = 0
-    tx_count = 0
-
-    if node.peers.is_banned(peer_ip):
-        # no need to loose any time with banned peers
-        raise ValueError("Cannot accept blocks from a banned peer")
-        # since we raise, it will also drop the connection, it's fine since he's banned.
-
-    if not db_lock.locked():
-        db_lock.acquire()
-
-        while mp.MEMPOOL.lock.locked():
-            time.sleep(0.1)
-            logger.app_log.info(f"Chain: Waiting for mempool to unlock {peer_ip}")
-
-        logger.app_log.warning(f"Chain: Digesting started from {peer_ip}")
-        # variables that have been quantized are prefixed by q_ So we can avoid any unnecessary quantize again later. Takes time.
-        # Variables that are only used as quantized decimal are quantized once and for all.
-
-        block_size = Decimal(sys.getsizeof(str(data))) / Decimal(1000000)
-        logger.app_log.warning(f"Chain: Block size: {block_size} MB")
-
-        try:
-
-            block_list = data
-
-            # reject block with duplicate transactions
-            signature_list = []
-            block_transactions = []
-
-            for transaction_list in block_list:
-                block_count += 1
-
-                # Reworked process: we exit as soon as we find an error, no need to process further tests.
-                # Then the exception handler takes place.
-
-                # TODO EGG: benchmark this loop vs a single "WHERE IN" SQL
-                # move down, so bad format tx do not require sql query
-                for entry in transaction_list:  # sig 4
-                    tx_count += 1
-                    entry_signature = entry[4]
-                    if entry_signature:  # prevent empty signature database retry hack
-                        signature_list.append(entry_signature)
-                        # reject block with transactions which are already in the ledger ram
-
-                        db_handler.execute_param(db_handler.h3, "SELECT block_height FROM transactions WHERE signature = ?;",
-                                                 (entry_signature,))
-                        tx_presence_check = db_handler.h3.fetchone()
-                        if tx_presence_check:
-                            # print(node.last_block)
-                            raise ValueError(f"That transaction {entry_signature[:10]} is already in our ram ledger, block_height {tx_presence_check[0]}")
-
-                        db_handler.execute_param(db_handler.c, "SELECT block_height FROM transactions WHERE signature = ?;",
-                                                 (entry_signature,))
-                        tx_presence_check = db_handler.c.fetchone()
-                        if tx_presence_check:
-                            # print(node.last_block)
-                            raise ValueError(f"That transaction {entry_signature[:10]} is already in our ledger, block_height {tx_presence_check[0]}")
-                    else:
-                        raise ValueError(f"Empty signature from {peer_ip}")
-
-                tx_count = len(signature_list)
-                if tx_count != len(set(signature_list)):
-                    raise ValueError("There are duplicate transactions in this block, rejected")
-
-                del signature_list[:]
-
-                # previous block info
-                db_handler.execute(db_handler.c,
-                                   "SELECT block_hash, block_height, timestamp FROM transactions WHERE reward != 0 ORDER BY block_height DESC LIMIT 1;")
-                result = db_handler.c.fetchall()
-                db_block_hash = result[0][0]
-                db_block_height = result[0][1]
-                q_db_timestamp_last = quantize_two(result[0][2])
-                block_height_new = db_block_height + 1
-                node.last_block = block_height_new
-                # previous block info
-
-                transaction_list_converted = []  # makes sure all the data are properly converted
-                for tx_index, transaction in enumerate(transaction_list):
-                    q_time_now = quantize_two(time.time())
-                    # verify signatures
-                    q_received_timestamp = quantize_two(transaction[0])  # we use this several times
-                    received_timestamp = '%.2f' % q_received_timestamp
-                    received_address = str(transaction[1])[:56]
-                    received_recipient = str(transaction[2])[:56]
-                    received_amount = '%.8f' % (quantize_eight(transaction[3]))
-                    received_signature_enc = str(transaction[4])[:684]
-                    received_public_key_hashed = str(transaction[5])[:1068]
-                    received_operation = str(transaction[6])[:30]
-                    received_openfield = str(transaction[7])[:100000]
-
-                    # if transaction == transaction_list[-1]:
-                    if tx_index == tx_count - 1:  # faster than comparing the whole tx
-                        # recognize the last transaction as the mining reward transaction
-                        q_block_timestamp = q_received_timestamp
-                        nonce = received_openfield[:128]
-                        miner_address = received_address
-
-                    transaction_list_converted.append((received_timestamp, received_address, received_recipient,
-                                                       received_amount, received_signature_enc,
-                                                       received_public_key_hashed, received_operation,
-                                                       received_openfield))
-
-                    # if (q_time_now < q_received_timestamp + 432000) or not quicksync:
-
-                    # convert readable key to instance
-                    received_public_key = RSA.importKey(base64.b64decode(received_public_key_hashed))
-
-                    received_signature_dec = base64.b64decode(received_signature_enc)
-                    verifier = PKCS1_v1_5.new(received_public_key)
-
-                    validate_pem(received_public_key_hashed)
-
-                    sha_hash = SHA.new(str((received_timestamp, received_address, received_recipient, received_amount,
-                                        received_operation, received_openfield)).encode("utf-8"))
-                    if not verifier.verify(sha_hash, received_signature_dec):
-                        raise ValueError(f"Invalid signature from {received_address}")
-                    else:
-                        logger.app_log.info(f"Valid signature from {received_address} to {received_recipient} amount {received_amount}")
-                    if float(received_amount) < 0:
-                        raise ValueError("Negative balance spend attempt")
-
-                    if received_address != hashlib.sha224(base64.b64decode(received_public_key_hashed)).hexdigest():
-                        raise ValueError("Attempt to spend from a wrong address")
-
-                    if not essentials.address_validate(received_address):
-                        raise ValueError("Not a valid sender address")
-
-                    if not essentials.address_validate(received_recipient):
-                        raise ValueError("Not a valid recipient address")
-
-                    if q_time_now < q_received_timestamp:
-                        raise ValueError(f"Future transaction not allowed, timestamp {quantize_two((q_received_timestamp - q_time_now) / 60)} minutes in the future")
-                    if q_db_timestamp_last - 86400 > q_received_timestamp:
-                        raise ValueError("Transaction older than 24h not allowed.")
-                        # verify signatures
-                        # else:
-                        # print("hyp1")
-
-                # reject blocks older than latest block
-                if q_block_timestamp <= q_db_timestamp_last:
-                    raise ValueError("Block is older than the previous one, will be rejected")
-
-                # calculate current difficulty
-                diff = difficulty(db_handler)
-                node.difficulty = diff
-
-                logger.app_log.warning(f"Time to generate block {db_block_height + 1}: {'%.2f' % diff[2]}")
-                logger.app_log.warning(f"Current difficulty: {diff[3]}")
-                logger.app_log.warning(f"Current blocktime: {diff[4]}")
-                logger.app_log.warning(f"Current hashrate: {diff[5]}")
-                logger.app_log.warning(f"Difficulty adjustment: {diff[6]}")
-                logger.app_log.warning(f"Difficulty: {diff[0]} {diff[1]}")
-
-                # logger.app_log.info("Transaction list: {}".format(transaction_list_converted))
-                block_hash = hashlib.sha224(
-                    (str(transaction_list_converted) + db_block_hash).encode("utf-8")).hexdigest()
-                # logger.app_log.info("Last block sha_hash: {}".format(db_block_hash))
-                logger.app_log.info(f"Calculated block sha_hash: {block_hash}")
-                # logger.app_log.info("Nonce: {}".format(nonce))
-
-                # check if we already have the sha_hash
-                db_handler.execute_param(db_handler.h3, "SELECT block_height FROM transactions WHERE block_hash = ?", (block_hash,))
-                dummy = db_handler.h3.fetchone()
-                if dummy:
-                    raise ValueError(
-                        "Skipping digestion of block {} from {}, because we already have it on block_height {}".
-                            format(block_hash[:10], peer_ip, dummy[0]))
-
-                if node.is_mainnet:
-                    if block_height_new < POW_FORK:
-                        diff_save = mining.check_block(block_height_new, miner_address, nonce, db_block_hash, diff[0],
-                                                       received_timestamp, q_received_timestamp, q_db_timestamp_last,
-                                                       peer_ip=peer_ip, app_log=logger.app_log)
-                    else:
-                        diff_save = mining_heavy3.check_block(block_height_new, miner_address, nonce, db_block_hash,
-                                                              diff[0],
-                                                              received_timestamp, q_received_timestamp,
-                                                              q_db_timestamp_last,
-                                                              peer_ip=peer_ip, app_log=logger.app_log)
-                elif node.is_testnet:
-                    diff_save = mining_heavy3.check_block(block_height_new, miner_address, nonce, db_block_hash,
-                                                          diff[0],
-                                                          received_timestamp, q_received_timestamp, q_db_timestamp_last,
-                                                          peer_ip=peer_ip, app_log=logger.app_log)
-                else:
-                    # it's regnet then, will use a specific fake method here.
-                    diff_save = mining_heavy3.check_block(block_height_new, miner_address, nonce, db_block_hash,
-                                                          regnet.REGNET_DIFF,
-                                                          received_timestamp, q_received_timestamp, q_db_timestamp_last,
-                                                          peer_ip=peer_ip, app_log=logger.app_log)
-
-                fees_block = []
-                mining_reward = 0  # avoid warning
-
-                # Cache for multiple tx from same address
-                balances = {}
-                for tx_index, transaction in enumerate(transaction_list):
-                    db_timestamp = '%.2f' % quantize_two(transaction[0])
-                    db_address = str(transaction[1])[:56]
-                    db_recipient = str(transaction[2])[:56]
-                    db_amount = '%.8f' % quantize_eight(transaction[3])
-                    db_signature = str(transaction[4])[:684]
-                    db_public_key_hashed = str(transaction[5])[:1068]
-                    db_operation = str(transaction[6])[:30]
-                    db_openfield = str(transaction[7])[:100000]
-
-                    block_debit_address = 0
-                    block_fees_address = 0
-
-                    # this also is redundant on many tx per address block
-                    for x in transaction_list:
-                        if x[1] == db_address:  # make calculation relevant to a particular address in the block
-                            block_debit_address = quantize_eight(Decimal(block_debit_address) + Decimal(x[3]))
-
-                            if x != transaction_list[-1]:
-                                block_fees_address = quantize_eight(Decimal(block_fees_address) + Decimal(
-                                    fee_calculate(db_openfield, db_operation,
-                                                  node.last_block)))  # exclude the mining tx from fees
-
-                    # print("block_fees_address", block_fees_address, "for", db_address)
-                    # logger.app_log.info("Digest: Inbound block credit: " + str(block_credit))
-                    # logger.app_log.info("Digest: Inbound block debit: " + str(block_debit))
-                    # include the new block
-
-                    # if (q_time_now < q_received_timestamp + 432000) and not quicksync:
-                    # balance_pre = quantize_eight(credit_ledger - debit_ledger - fees + rewards)  # without projection
-                    balance_pre = ledger_balance3(db_address, balances, db_handler)  # keep this as c (ram hyperblock access)
-
-                    # balance = quantize_eight(credit - debit - fees + rewards)
-                    balance = quantize_eight(balance_pre - block_debit_address)
-                    # logger.app_log.info("Digest: Projected transaction address balance: " + str(balance))
-                    # else:
-                    #    print("hyp2")
-
-                    fee = fee_calculate(db_openfield, db_operation, node.last_block)
-
-                    fees_block.append(quantize_eight(fee))
-                    # logger.app_log.info("Fee: " + str(fee))
-
-                    # decide reward
-                    if tx_index == tx_count - 1:
-                        db_amount = 0  # prevent spending from another address, because mining txs allow delegation
-                        if db_block_height <= 10000000:
-                            mining_reward = 15 - (
-                                    quantize_eight(block_height_new) / quantize_eight(1000000 / 2)) - Decimal("0.8")
-                            if mining_reward < 0:
-                                mining_reward = 0
-                        else:
-                            mining_reward = 0
-
-                        reward = quantize_eight(mining_reward + sum(fees_block[:-1]))
-                        # don't request a fee for mined block so new accounts can mine
-                        fee = 0
-                    else:
-                        reward = 0
-
-                    if quantize_eight(balance_pre) < quantize_eight(db_amount):
-                        raise ValueError(f"{db_address} sending more than owned: {db_amount}/{balance_pre}")
-
-                    if quantize_eight(balance) - quantize_eight(block_fees_address) < 0:
-                        # exclude fee check for the mining/header tx
-                        raise ValueError(f"{db_address} Cannot afford to pay fees")
-
-                    # append, but do not insert to ledger before whole block is validated, note that it takes already validated values (decimals, length)
-                    logger.app_log.info(f"Chain: Appending transaction back to block with {len(block_transactions)} transactions in it")
-                    block_transactions.append((str(block_height_new), str(db_timestamp), str(db_address), str(db_recipient), str(db_amount),
-                                               str(db_signature), str(db_public_key_hashed), str(block_hash), str(fee), str(reward),
-                                               str(db_operation), str(db_openfield)))
-
-                    try:
-                        mp.MEMPOOL.delete_transaction(db_signature)
-                        logger.app_log.info(
-                            f"Chain: Removed processed transaction {db_signature[:56]} from the mempool while digesting")
-                    except:
-                        # tx was not or is no more in the local mempool
-                        pass
-                # end for transaction_list
-
-                # save current diff (before the new block)
-                db_handler.execute_param(db_handler.c, "INSERT INTO misc VALUES (?, ?)", (block_height_new, diff_save))
-                db_handler.commit(db_handler.conn)
-
-                # quantized vars have to be converted, since Decimal is not json serializable...
-                node.plugin_manager.execute_action_hook('block',
-                                                        {'height': block_height_new, 'diff': diff_save,
-                                                         'sha_hash': block_hash, 'timestamp': float(q_block_timestamp),
-                                                         'miner': miner_address, 'ip': peer_ip})
-
-                node.plugin_manager.execute_action_hook('fullblock',
-                                                        {'height': block_height_new, 'diff': diff_save,
-                                                         'sha_hash': block_hash, 'timestamp': float(q_block_timestamp),
-                                                         'miner': miner_address, 'ip': peer_ip,
-                                                         'transactions': block_transactions})
-
-                # do not use "transaction" as it masks upper level variable.
-
-                db_handler.execute_many(db_handler.c, "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", block_transactions)
-                db_handler.commit(db_handler.conn)
-
-                # savings
-                if node.is_testnet or block_height_new >= 843000:
-                    # no savings for regnet
-                    if int(block_height_new) % 10000 == 0:  # every x blocks
-
-                        staking.staking_update(db_handler.conn, db_handler.c, db_handler.index, db_handler.index_cursor,
-                                               "normal", block_height_new, logger.app_log)
-                        staking.staking_payout(db_handler.conn, db_handler.c, db_handler.index, db_handler.index_cursor,
-                                               block_height_new, float(q_block_timestamp), logger.app_log)
-                        staking.staking_revalidate(db_handler.conn, db_handler.c, db_handler.index, db_handler.index_cursor,
-                                                   block_height_new, logger.app_log)
-
-                # new sha_hash
-                db_handler.execute(db_handler.c, "SELECT * FROM transactions WHERE block_height = (SELECT max(block_height) FROM transactions)")
-                # Was trying to simplify, but it's the latest mirror sha_hash. not the latest block, nor the mirror of the latest block.
-                # c.execute("SELECT * FROM transactions WHERE block_height = ?", (block_height_new -1,))
-                tx_list_to_hash = db_handler.c.fetchall()
-                mirror_hash = blake2b(str(tx_list_to_hash).encode(), digest_size=20).hexdigest()
-                # /new sha_hash
-
-                # dev reward
-                if int(block_height_new) % 10 == 0:  # every 10 blocks
-                    db_handler.execute_param(db_handler.c, "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                                             (-block_height_new, str(q_block_timestamp), "Development Reward", str(node.genesis_conf),
-                                              str(mining_reward), "0", "0", mirror_hash, "0", "0", "0", "0"))
-                    db_handler.commit(db_handler.conn)
-
-                    db_handler.execute_param(db_handler.c, "INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                                             (-block_height_new, str(q_block_timestamp), "Hypernode Payouts",
-                                              "3e08b5538a4509d9daa99e01ca5912cda3e98a7f79ca01248c2bde16",
-                                              "8", "0", "0", mirror_hash, "0", "0", "0", "0"))
-                    db_handler.commit(db_handler.conn)
-                # /dev reward
-
-                # logger.app_log.warning("Block: {}: {} valid and saved from {}".format(block_height_new, block_hash[:10], peer_ip))
-                logger.app_log.warning(
-                    f"Valid block: {block_height_new}: {block_hash[:10]} with {len(transaction_list)} txs, digestion from {peer_ip} completed in {str(time.time() - float(q_time_now))[:5]}s.")
-
-                del block_transactions[:]
-                node.peers.unban(peer_ip)
-
-                # This new block may change the int(diff). Trigger the hook whether it changed or not.
-                diff = difficulty(db_handler)
-                node.difficulty = diff
-                node.plugin_manager.execute_action_hook('diff', diff[0])
-                # We could recalc diff after inserting block, and then only trigger the block hook, but I fear this would delay the new block event.
-
-                # /whole block validation
-                # NEW: returns new block sha_hash
-
-            checkpoint_set(block_height_new)
-            return block_hash
-
-        except Exception as e:
-            logger.app_log.warning(f"Chain processing failed: {e}")
-
-            logger.app_log.info(f"Received data dump: {data}")
-
-            failed_cause = str(e)
-            # Temp
-
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-            print(exc_type, fname, exc_tb.tb_lineno)
-
-            if node.peers.warning(sdef, peer_ip, "Rejected block", 2):
-                raise ValueError(f"{peer_ip} banned")
-            raise ValueError("Chain: digestion aborted")
-
-        finally:
-            if node.full_ledger or node.ram_conf:
-                # first case move stuff from hyper.db to ledger.db; second case move stuff from ram to both
-                db_to_drive(db_handler)
-            db_lock.release()
-            delta_t = time.time() - float(q_time_now)
-            # logger.app_log.warning("Block: {}: {} digestion completed in {}s.".format(block_height_new,  block_hash[:10], delta_t))
-            node.plugin_manager.execute_action_hook('digestblock',
-                                                    {'failed': failed_cause, 'ip': peer_ip, 'deltat': delta_t,
-                                                     "blocks": block_count, "txs": tx_count})
-
-    else:
-        logger.app_log.warning(f"Chain: Skipping processing from {peer_ip}, someone delivered data faster")
-        node.plugin_manager.execute_action_hook('digestblock', {'failed': "skipped", 'ip': peer_ip})
-
-
-def coherence_check(db_handler):
+def sequencing_check(db_handler):
     try:
-        with open("coherence_last", 'r') as filename:
-            coherence_last = int(filename.read())
+        with open("sequencing_last", 'r') as filename:
+            sequencing_last = int(filename.read())
 
     except:
-        logger.app_log.warning("Coherence anchor not found, going through the whole chain")
-        coherence_last = 0
+        node.logger.app_log.warning("Sequencing anchor not found, going through the whole chain")
+        sequencing_last = 0
 
-    logger.app_log.warning(f"Status: Testing chain coherence, starting with block {coherence_last}")
+    node.logger.app_log.warning(f"Status: Testing chain sequencing, starting with block {sequencing_last}")
 
     if node.full_ledger:
         chains_to_check = [node.ledger_path_conf, node.hyper_path_conf]
@@ -1267,8 +640,8 @@ def coherence_check(db_handler):
         y = None
         # Egg: not sure block_height != (0 OR 1)  gives the proper result, 0 or 1  = 1. not in (0, 1) could be better.
         for row in c.execute(
-                "SELECT block_height FROM transactions WHERE reward != 0 AND block_height != (0 OR 1) AND block_height >= ? ORDER BY block_height ASC",
-                (coherence_last,)):
+                "SELECT block_height FROM transactions WHERE reward != 0 AND block_height > 1 AND block_height >= ? ORDER BY block_height ASC",
+                (sequencing_last,)):
             y_init = row[0]
 
             if y is None:
@@ -1279,20 +652,20 @@ def coherence_check(db_handler):
                 for chain2 in chains_to_check:
                     conn2 = sqlite3.connect(chain2)
                     c2 = conn2.cursor()
-                    logger.app_log.warning(f"Status: Chain {chain} transaction coherence error at: {row[0] - 1}. {row[0]} instead of {y}")
-                    c2.execute("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (row[0] - 1, -(row[0] + 1)))
+                    node.logger.app_log.warning(f"Status: Chain {chain} transaction sequencing error at: {row[0]}. {row[0]} instead of {y}")
+                    c2.execute("DELETE FROM transactions WHERE block_height >= ? OR block_height <= ?", (row[0], -row[0],))
                     conn2.commit()
-                    c2.execute("DELETE FROM misc WHERE block_height >= ?", (row[0] - 1,))
+                    c2.execute("DELETE FROM misc WHERE block_height >= ?", (row[0],))
                     conn2.commit()
 
                     # rollback indices
-                    tokens_rollback(y, db_handler)
-                    aliases_rollback(y, db_handler)
-                    staking_rollback(y, db_handler)
+                    tokens_rollback(node, y, db_handler)
+                    aliases_rollback(node, y, db_handler)
+                    staking_rollback(node, y, db_handler)
 
                     # rollback indices
 
-                    logger.app_log.warning(f"Status: Due to a coherence issue at block {y}, {chain} has been rolled back and will be resynchronized")
+                    node.logger.app_log.warning(f"Status: Due to a sequencing issue at block {y}, {chain} has been rolled back and will be resynchronized")
                 break
 
             y = y + 1
@@ -1314,35 +687,35 @@ def coherence_check(db_handler):
                 for chain2 in chains_to_check:
                     conn2 = sqlite3.connect(chain2)
                     c2 = conn2.cursor()
-                    logger.app_log.warning(
-                        f"Status: Chain {chain} difficulty coherence error at: {row[0] - 1} {row[0]} instead of {y}")
-                    c2.execute("DELETE FROM transactions WHERE block_height >= ?", (row[0] - 1,))
+                    node.logger.app_log.warning(
+                        f"Status: Chain {chain} difficulty sequencing error at: {row[0]} {row[0]} instead of {y}")
+                    c2.execute("DELETE FROM transactions WHERE block_height >= ?", row[0],)
                     conn2.commit()
-                    c2.execute("DELETE FROM misc WHERE block_height >= ?", (row[0] - 1,))
+                    c2.execute("DELETE FROM misc WHERE block_height >= ?", row[0],)
                     conn2.commit()
 
                     db_handler.execute_param(conn2, (
                         'DELETE FROM transactions WHERE address = "Development Reward" AND block_height <= ?'),
-                                             (-(row[0] + 1),))
+                                             (-row[0],))
                     conn2.commit()
                     conn2.close()
 
                     # rollback indices
-                    tokens_rollback(y, db_handler)
-                    aliases_rollback(y, db_handler)
-                    staking_rollback(y, db_handler)
+                    tokens_rollback(node, y, db_handler)
+                    aliases_rollback(node, y, db_handler)
+                    staking_rollback(node, y, db_handler)
                     # rollback indices
 
-                    logger.app_log.warning(f"Status: Due to a coherence issue at block {y}, {chain} has been rolled back and will be resynchronized")
+                    node.logger.app_log.warning(f"Status: Due to a sequencing issue at block {y}, {chain} has been rolled back and will be resynchronized")
                 break
 
             y = y + 1
 
-        logger.app_log.warning(f"Status: Chain coherence test complete for {chain}")
+        node.logger.app_log.warning(f"Status: Chain sequencing test complete for {chain}")
         conn.close()
 
         if y:
-            with open("coherence_last", 'w') as filename:
+            with open("sequencing_last", 'w') as filename:
                 filename.write(str(y - 1000))  # room for rollbacks
 
 
@@ -1354,22 +727,22 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             return
 
         client_instance = classes.Client()
-        db_handler_instance = dbhandler.DbHandler(node.index_db, node.ledger_path_conf, node.hyper_path_conf, node.full_ledger, node.ram_conf, node.ledger_ram_file, logger, q)
+        db_handler_instance = dbhandler.DbHandler(node.index_db, node.ledger_path_conf, node.hyper_path_conf, node.full_ledger, node.ram_conf, node.ledger_ram_file, node.logger)
 
         try:
             peer_ip = self.request.getpeername()[0]
         except:
-            logger.app_log.warning("Inbound: Transport endpoint was not connected")
+            node.logger.app_log.warning("Inbound: Transport endpoint was not connected")
             return
+
         # if threading.active_count() < node.thread_limit_conf or peer_ip == "127.0.0.1":
         # Always keep a slot for whitelisted (wallet could be there)
         if threading.active_count() < node.thread_limit_conf / 3 * 2 or node.peers.is_whitelisted(peer_ip):  # inbound
-            node.capacity = True
+            client_instance.connected = True
         else:
-            node.capacity = False
             try:
                 self.request.close()
-                logger.app_log.info(f"Free capacity for {peer_ip} unavailable, disconnected")
+                node.logger.app_log.info(f"Free capacity for {peer_ip} unavailable, disconnected")
                 # if you raise here, you kill the whole server
             except:
                 pass
@@ -1382,7 +755,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
             client_instance.banned = True
             try:
                 self.request.close()
-                logger.app_log.info(f"IP {peer_ip} banned, disconnected")
+                node.logger.app_log.info(f"IP {peer_ip} banned, disconnected")
             except:
                 pass
             finally:
@@ -1391,7 +764,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
         timeout_operation = 120  # timeout
         timer_operation = time.time()  # start counting
 
-        while not client_instance.banned and node.capacity and node.peers.version_allowed(peer_ip, node.version_allow) and not node.IS_STOPPING:
+        while not client_instance.banned and node.peers.version_allowed(peer_ip, node.version_allow) and client_instance.connected and not node.IS_STOPPING:
             try:
                 # Failsafe
                 if self.request == -1:
@@ -1399,14 +772,14 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                 if not time.time() <= timer_operation + timeout_operation:  # return on timeout
                     if node.peers.warning(self.request, peer_ip, "Operation timeout", 2):
-                        logger.app_log.info(f"{peer_ip} banned")
+                        node.logger.app_log.info(f"{peer_ip} banned")
                         break
 
                     raise ValueError(f"Inbound: Operation timeout from {peer_ip}")
 
                 data = receive(self.request)
 
-                logger.app_log.info(
+                node.logger.app_log.info(
                     f"Inbound: Received: {data} from {peer_ip}")  # will add custom ports later
 
                 if data.startswith('regtest_'):
@@ -1418,17 +791,17 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         block_hash = db_handler_instance.c.fetchone()[0]
                         # feed regnet with current thread db handle. refactor needed.
                         regnet.conn, regnet.c, regnet.hdd, regnet.h, regnet.hdd2, regnet.h2, regnet.h3 = db_handler_instance.conn, db_handler_instance.c, db_handler_instance.hdd, db_handler_instance.h, db_handler_instance.hdd2, db_handler_instance.h2, db_handler_instance.h3
-                        regnet.command(self.request, data, block_hash)
+                        regnet.command(self.request, data, block_hash, node, db_handler_instance)
 
                 if data == 'version':
                     data = receive(self.request)
                     if data not in node.version_allow:
-                        logger.app_log.warning(
+                        node.logger.app_log.warning(
                             f"Protocol version mismatch: {data}, should be {node.version_allow}")
                         send(self.request, "notok")
                         return
                     else:
-                        logger.app_log.warning(f"Inbound: Protocol version matched with {peer_ip}: {data}")
+                        node.logger.app_log.warning(f"Inbound: Protocol version matched with {peer_ip}: {data}")
                         send(self.request, "ok")
                         node.peers.store_mainnet(peer_ip, data)
 
@@ -1439,7 +812,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                     # receive theirs
                     segments = receive(self.request)
-                    logger.app_log.info(mp.MEMPOOL.merge(segments, peer_ip, db_handler_instance.c, False))
+                    node.logger.app_log.info(mp.MEMPOOL.merge(segments, peer_ip, db_handler_instance.c, False))
 
                     # receive theirs
 
@@ -1454,7 +827,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         mempool_txs = []
 
                     # send own
-                    # logger.app_log.info("Inbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
+                    # node.logger.app_log.info("Inbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
 
                     # if len(mempool_txs) > 0: same as the other
                     send(self.request, mempool_txs)
@@ -1463,21 +836,21 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                 elif data == "hello":
                     if node.is_regnet:
-                        logger.app_log.info("Inbound: Got hello but I'm in regtest mode, closing.")
+                        node.logger.app_log.info("Inbound: Got hello but I'm in regtest mode, closing.")
                         return
 
                     send(self.request, "peers")
                     peers_send = node.peers.peer_list_disk_format()
                     send(self.request, peers_send)
 
-                    while db_lock.locked():
+                    while node.db_lock.locked():
                         time.sleep(quantize_two(node.pause_conf))
-                    logger.app_log.info("Inbound: Sending sync request")
+                    node.logger.app_log.info("Inbound: Sending sync request")
 
                     send(self.request, "sync")
 
                 elif data == "sendsync":
-                    while db_lock.locked():
+                    while node.db_lock.locked():
                         time.sleep(quantize_two(node.pause_conf))
 
                     while len(node.syncing) >= 3:
@@ -1488,12 +861,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                     send(self.request, "sync")
 
                 elif data == "blocksfnd":
-                    logger.app_log.info(f"Inbound: Client {peer_ip} has the block(s)")  # node should start sending txs in this step
+                    node.logger.app_log.info(f"Inbound: Client {peer_ip} has the block(s)")  # node should start sending txs in this step
 
-                    # logger.app_log.info("Inbound: Combined segments: " + segments)
+                    # node.logger.app_log.info("Inbound: Combined segments: " + segments)
                     # print peer_ip
-                    if db_lock.locked():
-                        logger.app_log.info(f"Skipping sync from {peer_ip}, syncing already in progress")
+                    if node.db_lock.locked():
+                        node.logger.app_log.info(f"Skipping sync from {peer_ip}, syncing already in progress")
 
                     else:
                         db_handler_instance.execute(db_handler_instance.c,
@@ -1503,17 +876,17 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         if node.last_block_timestamp < time.time() - 600:
                             # block_req = most_common(consensus_blockheight_list)
                             block_req = node.peers.consensus_most_common
-                            logger.app_log.warning("Most common block rule triggered")
+                            node.logger.app_log.warning("Most common block rule triggered")
 
                         else:
                             # block_req = max(consensus_blockheight_list)
                             block_req = node.peers.consensus_max
-                            logger.app_log.warning("Longest chain rule triggered")
+                            node.logger.app_log.warning("Longest chain rule triggered")
 
                         if int(received_block_height) >= block_req:
 
                             try:  # they claim to have the longest chain, things must go smooth or ban
-                                logger.app_log.warning(f"Confirming to sync from {peer_ip}")
+                                node.logger.app_log.warning(f"Confirming to sync from {peer_ip}")
                                 node.plugin_manager.execute_action_hook('sync', {'what': 'syncing_from', 'ip': peer_ip})
                                 send(self.request, "blockscf")
 
@@ -1521,16 +894,14 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                             except:
                                 if node.peers.warning(self.request, peer_ip, "Failed to deliver the longest chain"):
-                                    logger.app_log.info(f"{peer_ip} banned")
+                                    node.logger.app_log.info(f"{peer_ip} banned")
                                     break
                             else:
-                                digest_block(segments, self.request, peer_ip, db_handler_instance)
-
-                                # receive theirs
+                                digest_block(node, segments, self.request, peer_ip, db_handler_instance)
                         else:
-                            logger.app_log.warning(f"Rejecting to sync from {peer_ip}")
+                            node.logger.app_log.warning(f"Rejecting to sync from {peer_ip}")
                             send(self.request, "blocksrj")
-                            logger.app_log.info(
+                            node.logger.app_log.info(
                                 f"Inbound: Distant peer {peer_ip} is at {received_block_height}, should be at least {block_req}")
 
                     send(self.request, "sync")
@@ -1538,7 +909,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 elif data == "blockheight":
                     try:
                         received_block_height = receive(self.request)  # receive client's last block height
-                        logger.app_log.info(
+                        node.logger.app_log.info(
                             f"Inbound: Received block height {received_block_height} from {peer_ip} ")
 
                         # consensus pool 1 (connection from them)
@@ -1555,13 +926,13 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         # send own block height
 
                         if int(received_block_height) > db_block_height:
-                            logger.app_log.warning("Inbound: Client has higher block")
+                            node.logger.app_log.warning("Inbound: Client has higher block")
 
                             db_handler_instance.execute(db_handler_instance.c,
                                                         'SELECT block_hash FROM transactions ORDER BY block_height DESC LIMIT 1')
                             db_block_hash = db_handler_instance.c.fetchone()[0]  # get latest block_hash
 
-                            logger.app_log.info(f"Inbound: block_hash to send: {db_block_hash}")
+                            node.logger.app_log.info(f"Inbound: block_hash to send: {db_block_hash}")
                             send(self.request, db_block_hash)
 
                             # receive their latest sha_hash
@@ -1569,37 +940,37 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         elif int(received_block_height) <= db_block_height:
                             if int(received_block_height) == db_block_height:
-                                logger.app_log.info(
+                                node.logger.app_log.info(
                                     f"Inbound: We have the same height as {peer_ip} ({received_block_height}), hash will be verified")
                             else:
-                                logger.app_log.warning(
+                                node.logger.app_log.warning(
                                     f"Inbound: We have higher ({db_block_height}) block height than {peer_ip} ({received_block_height}), hash will be verified")
 
                             data = receive(self.request)  # receive client's last block_hash
                             # send all our followup hashes
 
-                            logger.app_log.info(f"Inbound: Will seek the following block: {data}")
+                            node.logger.app_log.info(f"Inbound: Will seek the following block: {data}")
 
                             try:
                                 db_handler_instance.execute_param(db_handler_instance.h3,
                                                                   "SELECT block_height FROM transactions WHERE block_hash = ?;", (data,))
                                 client_block = db_handler_instance.h3.fetchone()[0]
                             except Exception:
-                                logger.app_log.warning(f"Inbound: Block {data[:8]} of {peer_ip}")
+                                node.logger.app_log.warning(f"Inbound: Block {data[:8]} of {peer_ip}")
                                 send(self.request, "blocknf")
                                 send(self.request, data)
 
                             else:
-                                logger.app_log.info(f"Inbound: Client is at block {client_block}")  # now check if we have any newer
+                                node.logger.app_log.info(f"Inbound: Client is at block {client_block}")  # now check if we have any newer
 
                                 db_handler_instance.execute(db_handler_instance.h3,
                                                             'SELECT block_hash FROM transactions ORDER BY block_height DESC LIMIT 1')
                                 db_block_hash = db_handler_instance.h3.fetchone()[0]  # get latest block_hash
                                 if db_block_hash == data or not node.egress:
                                     if not node.egress:
-                                        logger.app_log.warning(f"Outbound: Egress disabled for {peer_ip}")
+                                        node.logger.app_log.warning(f"Outbound: Egress disabled for {peer_ip}")
                                     else:
-                                        logger.app_log.info(f"Inbound: Client {peer_ip} has the latest block")
+                                        node.logger.app_log.info(f"Inbound: Client {peer_ip} has the latest block")
 
                                     time.sleep(int(node.pause_conf))  # reduce CPU usage
                                     send(self.request, "nonewblk")
@@ -1621,24 +992,24 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                                     # blocks_send = [[l[1:] for l in group] for _, group in groupby(blocks_fetched, key=itemgetter(0))]  # remove block number
 
-                                    # logger.app_log.info("Inbound: Selected " + str(blocks_fetched) + " to send")
+                                    # node.logger.app_log.info("Inbound: Selected " + str(blocks_fetched) + " to send")
 
                                     send(self.request, "blocksfnd")
 
                                     confirmation = receive(self.request)
 
                                     if confirmation == "blockscf":
-                                        logger.app_log.info("Inbound: Client confirmed they want to sync from us")
+                                        node.logger.app_log.info("Inbound: Client confirmed they want to sync from us")
                                         send(self.request, blocks_fetched)
 
                                     elif confirmation == "blocksrj":
-                                        logger.app_log.info(
+                                        node.logger.app_log.info(
                                             "Inbound: Client rejected to sync from us because we're don't have the latest block")
 
 
 
                     except Exception as e:
-                        logger.app_log.info(f"Inbound: Sync failed {e}")
+                        node.logger.app_log.info(f"Inbound: Sync failed {e}")
 
                 elif data == "nonewblk":
                     send(self.request, "sync")
@@ -1647,13 +1018,13 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                     block_hash_delete = receive(self.request)
                     # print peer_ip
                     if consensus_blockheight == node.peers.consensus_max:
-                        blocknf(block_hash_delete, peer_ip, db_handler_instance)
+                        blocknf(node, block_hash_delete, peer_ip, db_handler_instance)
                         if node.peers.warning(self.request, peer_ip, "Rollback", 2):
-                            logger.app_log.info(f"{peer_ip} banned")
+                            node.logger.app_log.info(f"{peer_ip} banned")
                             break
-                    logger.app_log.info("Outbound: Deletion complete, sending sync request")
+                    node.logger.app_log.info("Outbound: Deletion complete, sending sync request")
 
-                    while db_lock.locked():
+                    while node.db_lock.locked():
                         if node.IS_STOPPING:
                             return
                         time.sleep(node.pause_conf)
@@ -1664,10 +1035,10 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                     if node.peers.is_allowed(peer_ip, data):  # from miner
                         # TODO: rights management could be done one level higher instead of repeating the same check everywhere
 
-                        logger.app_log.info(f"Outbound: Received a block from miner {peer_ip}")
+                        node.logger.app_log.info(f"Outbound: Received a block from miner {peer_ip}")
                         # receive block
                         segments = receive(self.request)
-                        # logger.app_log.info("Inbound: Combined mined segments: " + segments)
+                        # node.logger.app_log.info("Inbound: Combined mined segments: " + segments)
 
                         # check if we have the latest block
 
@@ -1687,27 +1058,31 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                 reason = "Outbound: Mined block ignored, insufficient connections to the network"
                                 mined['reason'] = reason
                                 node.plugin_manager.execute_action_hook('mined', mined)
-                                logger.app_log.info(reason)
-                            elif db_lock.locked():
+                                node.logger.app_log.info(reason)
+                            elif node.db_lock.locked():
                                 reason = "Outbound: Block from miner skipped because we are digesting already"
                                 mined['reason'] = reason
                                 node.plugin_manager.execute_action_hook('mined', mined)
-                                logger.app_log.warning(reason)
+                                node.logger.app_log.warning(reason)
                             elif db_block_height >= node.peers.consensus_max - 3:
                                 mined['result'] = True
                                 node.plugin_manager.execute_action_hook('mined', mined)
-                                logger.app_log.info("Outbound: Processing block from miner")
-                                digest_block(segments, self.request, peer_ip, db_handler_instance)
+                                node.logger.app_log.info("Outbound: Processing block from miner")
+                                digest_block(node, segments, self.request, peer_ip, db_handler_instance)
+                                # This new block may change the int(diff). Trigger the hook whether it changed or not.
+                                diff = difficulty(node, db_handler_instance)
+
                             else:
                                 reason = f"Outbound: Mined block was orphaned because node was not synced, we are at block {db_block_height}, should be at least {node.peers.consensus_max - 3}"
                                 mined['reason'] = reason
                                 node.plugin_manager.execute_action_hook('mined', mined)
-                                logger.app_log.warning(reason)
+                                node.logger.app_log.warning(reason)
                         else:
-                            digest_block(segments, self.request, peer_ip, db_handler_instance)
+                            digest_block(node, segments, self.request, peer_ip, db_handler_instance)
+
                     else:
                         receive(self.request)  # receive block, but do nothing about it
-                        logger.app_log.info(f"{peer_ip} not whitelisted for block command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for block command")
 
                 elif data == "blocklast":
                     # if (peer_ip in allowed or "any" in allowed):  # only sends the miner part of the block!
@@ -1718,7 +1093,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         logger.app_log.info(f"Status: NODE: blocklast={block_last}")
                         send(self.request, block_last)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for blocklast command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for blocklast command")
 
                 elif data == "blocklastjson":
                     # if (peer_ip in allowed or "any" in allowed):  # only sends the miner part of the block!
@@ -1742,7 +1117,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, response)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for blocklastjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for blocklastjson command")
 
                 elif data == "blockget":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1755,7 +1130,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, block_desired_result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for blockget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for blockget command")
 
                 elif data == "blockgetjson":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1785,19 +1160,19 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, response_list)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for blockget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for blockget command")
 
                 elif data == "mpinsert":
                     # if (peer_ip in allowed or "any" in allowed):
                     if node.peers.is_allowed(peer_ip, data):
                         mempool_insert = receive(self.request)
-                        logger.app_log.warning("mpinsert command")
+                        node.logger.app_log.warning("mpinsert command")
 
                         mpinsert_result = mp.MEMPOOL.merge(mempool_insert, peer_ip, db_handler_instance.c, True, True)
-                        logger.app_log.warning(f"mpinsert result: {mpinsert_result}")
+                        node.logger.app_log.warning(f"mpinsert result: {mpinsert_result}")
                         send(self.request, mpinsert_result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for mpinsert command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for mpinsert command")
 
                 elif data == "balanceget":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1810,7 +1185,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                          balanceget_result)  # return balance of the address to the client, including mempool
                         # send(self.request, balance_pre)  # return balance of the address to the client, no mempool
                     else:
-                        logger.app_log.info("{peer_ip} not whitelisted for balanceget command")
+                        node.logger.app_log.info("{peer_ip} not whitelisted for balanceget command")
 
                 elif data == "balancegetjson":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1829,7 +1204,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                          response)  # return balance of the address to the client, including mempool
                         # send(self.request, balance_pre)  # return balance of the address to the client, no mempool
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for balancegetjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for balancegetjson command")
 
                 elif data == "balancegethyper":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1842,7 +1217,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                          balanceget_result)  # return balance of the address to the client, including mempool
                         # send(self.request, balance_pre)  # return balance of the address to the client, no mempool
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for balancegetjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for balancegetjson command")
 
                 elif data == "balancegethyperjson":
                     if node.peers.is_allowed(peer_ip, data):
@@ -1855,7 +1230,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                          response)  # return balance of the address to the client, including mempool
                         # send(self.request, balance_pre)  # return balance of the address to the client, no mempool
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for balancegethyperjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for balancegethyperjson command")
 
                 elif data == "mpgetjson" and node.peers.is_allowed(peer_ip, data):
                     mempool_txs = mp.MEMPOOL.fetchall(mp.SQL_SELECT_TX_TO_SEND)
@@ -1873,7 +1248,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         response_list.append(response)
 
-                    # logger.app_log.info("Outbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
+                    # node.logger.app_log.info("Outbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
 
                     # if len(mempool_txs) > 0: #wont sync mempool until we send something, which is bad
                     # send own
@@ -1882,7 +1257,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 elif data == "mpget" and node.peers.is_allowed(peer_ip, data):
                     mempool_txs = mp.MEMPOOL.fetchall(mp.SQL_SELECT_TX_TO_SEND)
 
-                    # logger.app_log.info("Outbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
+                    # node.logger.app_log.info("Outbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
 
                     # if len(mempool_txs) > 0: #wont sync mempool until we send something, which is bad
                     # send own
@@ -1898,7 +1273,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         send(self.request, (gen_private_key_readable, gen_public_key_readable, gen_address))
                         (gen_private_key_readable, gen_public_key_readable, gen_address) = (None, None, None)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for keygen command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for keygen command")
 
                 elif data == "keygenjson":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1911,7 +1286,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         send(self.request, response)
                         (gen_private_key_readable, gen_public_key_readable, gen_address) = (None, None, None)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for keygen command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for keygen command")
 
                 elif data == "addlist":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1923,7 +1298,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         result = db_handler_instance.h3.fetchall()
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addlist command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addlist command")
 
                 elif data == "listlimjson":
                     # if (peer_ip in allowed or "any" in allowed):
@@ -1953,7 +1328,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, response_list)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for listlimjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for listlimjson command")
 
                 elif data == "listlim":
                     if node.peers.is_allowed(peer_ip, data):
@@ -1964,7 +1339,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         result = db_handler_instance.h3.fetchall()
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for listlim command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for listlim command")
 
                 elif data == "addlistlim":
                     if node.peers.is_allowed(peer_ip, data):
@@ -1978,7 +1353,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         result = db_handler_instance.h3.fetchall()
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addlistlim command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addlistlim command")
 
                 elif data == "addlistlimjson":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2010,7 +1385,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, response_list)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addlistlimjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addlistlimjson command")
 
                 elif data == "addlistlimmir":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2024,7 +1399,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         result = db_handler_instance.h3.fetchall()
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addlistlimmir command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addlistlimmir command")
 
                 elif data == "addlistlimmirjson":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2058,12 +1433,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addlistlimmir command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addlistlimmir command")
 
 
                 elif data == "aliasget":  # all for a single address, no protection against overlapping
                     if node.peers.is_allowed(peer_ip, data):
-                        aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log)
+                        aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log)
 
                         alias_address = receive(self.request)
 
@@ -2077,11 +1452,11 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for aliasget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for aliasget command")
 
                 elif data == "aliasesget":  # only gets the first one, for multiple addresses
                     if node.peers.is_allowed(peer_ip, data):
-                        aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log)
+                        aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log)
 
                         aliases_request = receive(self.request)
 
@@ -2098,17 +1473,17 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, results)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for aliasesget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for aliasesget command")
 
                 # Not mandatory, but may help to reindex with minimal sql queries
                 elif data == "tokensupdate":
                     if node.peers.is_allowed(peer_ip, data):
-                        tokens.tokens_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log,
+                        tokens.tokens_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log,
                                              node.plugin_manager)
                 #
                 elif data == "tokensget":
                     if node.peers.is_allowed(peer_ip, data):
-                        tokens.tokens_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log,
+                        tokens.tokens_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log,
                                              node.plugin_manager)
                         tokens_address = receive(self.request)
 
@@ -2137,12 +1512,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, tokens_list)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for tokensget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for tokensget command")
 
                 elif data == "addfromalias":
                     if node.peers.is_allowed(peer_ip, data):
 
-                        aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log)
+                        aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log)
 
                         alias_address = receive(self.request)
                         db_handler_instance.execute_param(db_handler_instance.index_cursor,
@@ -2152,12 +1527,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                             address_fetch = db_handler_instance.index_cursor.fetchone()[0]
                         except:
                             address_fetch = "No alias"
-                        logger.app_log.warning(f"Fetched the following alias address: {address_fetch}")
+                        node.logger.app_log.warning(f"Fetched the following alias address: {address_fetch}")
 
                         send(self.request, address_fetch)
 
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addfromalias command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addfromalias command")
 
                 elif data == "pubkeyget":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2170,7 +1545,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         send(self.request, target_public_key_hashed)
 
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for pubkeyget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for pubkeyget command")
 
                 elif data == "aliascheck":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2180,7 +1555,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                             "SELECT timestamp FROM transactions WHERE openfield = ?;",
                             ("alias=" + reg_string,))
 
-                        db_handler_instance.execute_param(db_handler_instance.h3, "SELECT timestamp FROM transactions WHERE openfield = ?;", "alias=" + reg_string, )
+                        db_handler_instance.execute_param(db_handler_instance.h3, "SELECT timestamp FROM transactions WHERE openfield = ?;", ("alias=" + reg_string,) )
                         registered_already = db_handler_instance.h3.fetchone()
 
                         if registered_already is None and registered_pending is None:
@@ -2188,7 +1563,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         else:
                             send(self.request, "Alias registered")
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for aliascheck command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for aliascheck command")
 
                 elif data == "txsend":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2229,13 +1604,13 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                          str(remote_tx_pubkey_hashed), str(remote_tx_operation),
                                          str(remote_tx_openfield)))
 
-                        logger.app_log.info(mp.MEMPOOL.merge(mempool_data, peer_ip, db_handler_instance.c, True, True))
+                        node.logger.app_log.info(mp.MEMPOOL.merge(mempool_data, peer_ip, db_handler_instance.c, True, True))
 
                         send(self.request, str(remote_signature_enc))
                         # wipe variables
                         (tx_remote, remote_tx_privkey, tx_remote_key) = (None, None, None)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for txsend command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for txsend command")
 
                 # less important methods
                 elif data == "addvalidate":
@@ -2249,7 +1624,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for addvalidate command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for addvalidate command")
 
                 elif data == "annget":
                     if node.peers.is_allowed(peer_ip):
@@ -2265,7 +1640,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, result)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for annget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for annget command")
 
                 elif data == "annverget":
                     if node.peers.is_allowed(peer_ip):
@@ -2279,14 +1654,14 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         send(self.request, result)
 
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for annget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for annget command")
 
                 elif data == "peersget":
                     if node.peers.is_allowed(peer_ip, data):
                         send(self.request, node.peers.peer_list_disk_format())
 
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for peersget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for peersget command")
 
                 elif data == "statusget":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2306,10 +1681,10 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, (
                             revealed_address, nodes_count, nodes_list, threads_count, uptime, node.peers.consensus,
-                            node.peers.consensus_percentage, VERSION, diff, server_timestamp))
+                            node.peers.consensus_percentage, app_version, diff, server_timestamp))
 
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for statusget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for statusget command")
 
                 elif data == "statusjson":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2323,7 +1698,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         status = {"protocolversion": node.version,
                                   "address": revealed_address,
-                                  "walletversion": VERSION,
+                                  "walletversion": app_version,
                                   "testnet": node.is_testnet,  # config data
                                   "blocks": node.last_block, "timeoffset": 0,
                                   "connections": node.peers.consensus_size,
@@ -2337,11 +1712,11 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                             status['regnet'] = True
                         send(self.request, status)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for statusjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for statusjson command")
                 elif data[:4] == 'api_':
                     if node.peers.is_allowed(peer_ip, data):
                         try:
-                            node.apihandler.dispatch(data, self.request, db_handler_instance.h3, node.peers)
+                            node.apihandler.dispatch(data, self.request, db_handler_instance, node.peers)
                         except Exception as e:
                             print(e)
 
@@ -2350,7 +1725,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         diff = node.difficulty
                         send(self.request, diff)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for diffget command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for diffget command")
 
                 elif data == "diffgetjson":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2366,7 +1741,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
 
                         send(self.request, response)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for diffgetjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for diffgetjson command")
 
                 elif data == "difflast":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2376,7 +1751,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                         difflast = db_handler_instance.h3.fetchone()
                         send(self.request, difflast)
                     else:
-                        logger.app_log.info("f{peer_ip} not whitelisted for difflastget command")
+                        node.logger.app_log.info("f{peer_ip} not whitelisted for difflastget command")
 
                 elif data == "difflastjson":
                     if node.peers.is_allowed(peer_ip, data):
@@ -2389,11 +1764,11 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                                     }
                         send(self.request, response)
                     else:
-                        logger.app_log.info(f"{peer_ip} not whitelisted for difflastjson command")
+                        node.logger.app_log.info(f"{peer_ip} not whitelisted for difflastjson command")
 
                 elif data == "stop":
                     if node.peers.is_allowed(peer_ip, data):
-                        logger.app_log.warning(f"Received stop from {peer_ip}")
+                        node.logger.app_log.warning(f"Received stop from {peer_ip}")
                         node.IS_STOPPING = True
 
 
@@ -2408,12 +1783,12 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                 if not time.time() <= timer_operation + timeout_operation:
                     timer_operation = time.time()  # reset timer
                 # time.sleep(float(node.pause_conf))  # prevent cpu overload
-                logger.app_log.info(f"Server loop finished for {peer_ip}")
+                node.logger.app_log.info(f"Server loop finished for {peer_ip}")
 
 
             except Exception as e:
-                logger.app_log.info(f"Inbound: Lost connection to {peer_ip}")
-                logger.app_log.info(f"Inbound: {e}")
+                node.logger.app_log.info(f"Inbound: Lost connection to {peer_ip}")
+                node.logger.app_log.info(f"Inbound: {e}")
 
                 # remove from consensus (connection from them)
                 node.peers.consensus_remove(peer_ip)
@@ -2427,7 +1802,7 @@ class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
                     return
 
         if not node.peers.version_allowed(peer_ip, node.version_allow):
-            logger.app_log.warning(f"Inbound: Closing connection to old {peer_ip} node: {node.peers.ip_to_mainnet['peer_ip']}")
+            node.logger.app_log.warning(f"Inbound: Closing connection to old {peer_ip} node: {node.peers.ip_to_mainnet['peer_ip']}")
 
 
 def ensure_good_peer_version(peer_ip):
@@ -2446,337 +1821,6 @@ def ensure_good_peer_version(peer_ip):
 
 # client thread
 # if you "return" from the function, the exception code will node be executed and client thread will hang
-def worker(host, port):
-    this_client = f"{host}:{port}"
-
-    if node.IS_STOPPING:
-        return
-
-    dict_ip = {'ip': host}
-    node.plugin_manager.execute_filter_hook('peer_ip', dict_ip)
-    client_instance_worker = classes.Client()
-
-    if node.peers.is_banned(host) or dict_ip['ip'] == 'banned':
-        client_instance_worker.banned = True
-        logger.app_log.warning(f"IP {host} is banned, won't connect")
-        return
-
-    timeout_operation = 60  # timeout
-    timer_operation = time.time()  # start counting
-
-    try:
-        db_handler_instance = dbhandler.DbHandler(node.index_db, node.ledger_path_conf, node.hyper_path_conf, node.full_ledger, node.ram_conf, node.ledger_ram_file, logger, q)
-
-        s = socks.socksocket()
-        
-        
-        if node.tor_conf:
-            s.setproxy(socks.PROXY_TYPE_SOCKS5, "127.0.0.1", 9050)
-        # s.setblocking(0)
-        s.connect((host, port))
-        logger.app_log.info(f"Outbound: Connected to {this_client}")
-
-        # communication starter
-
-        send(s, "version")
-        send(s, node.version)
-
-        data = receive(s)
-
-        if data == "ok":
-            logger.app_log.info(f"Outbound: Node protocol version of {this_client} matches our client")
-        else:
-            raise ValueError(f"Outbound: Node protocol version of {this_client} mismatch")
-
-        # If we are post pow fork, then the peer has getversion command
-        # if node.last_block >= POW_FORK - FORK_AHEAD:
-        # Peers that are not up to date will disconnect since they don't know that command.
-        # That is precisely what we need :D
-        send(s, "getversion")
-        peer_version = receive(s)
-        if peer_version not in node.version_allow:
-            raise ValueError(f"Outbound: Incompatible peer version {peer_version} from {this_client}")
-
-        send(s, "hello")
-
-        # communication starter
-
-    except Exception as e:
-        logger.app_log.info(f"Could not connect to {this_client}: {e}")
-        return  # can return here, because no lists are affected yet
-
-    # if node.last_block >= POW_FORK - FORK_AHEAD:
-    node.peers.store_mainnet(host, peer_version)
-    try:
-        peer_ip = s.getpeername()[0]
-    except:
-        # Should not happen, extra safety
-        logger.app_log.warning("Outbound: Transport endpoint was not connected")
-        return
-
-    if this_client not in node.peers.connection_pool:
-        node.peers.append_client(this_client)
-        logger.app_log.info(f"Connected to {this_client}")
-        logger.app_log.info(f"Current active pool: {node.peers.connection_pool}")
-
-    while not client_instance_worker.banned and node.peers.version_allowed(host, node.version_allow) and not node.IS_STOPPING:
-        try:
-            ensure_good_peer_version(host)
-
-            data = receive(s)  # receive data, one and the only root point
-            # print(data)
-
-            if data == "peers":
-                subdata = receive(s)
-                node.peers.peersync(subdata)
-
-            elif data == "sync":
-                if not time.time() <= timer_operation + timeout_operation:
-                    timer_operation = time.time()  # reset timer
-
-                try:
-                    while len(node.syncing) >= 3:
-                        if node.IS_STOPPING:
-                            return
-                        time.sleep(int(node.pause_conf))
-
-                    node.syncing.append(peer_ip)
-                    # sync start
-
-                    # send block height, receive block height
-                    send(s, "blockheight")
-
-                    db_handler_instance.execute(db_handler_instance.c, 'SELECT max(block_height) FROM transactions')
-                    db_block_height = db_handler_instance.c.fetchone()[0]
-
-                    logger.app_log.info(f"Outbound: Sending block height to compare: {db_block_height}")
-                    # append zeroes to get static length
-                    send(s, db_block_height)
-
-                    received_block_height = receive(s)  # receive node's block height
-                    logger.app_log.info(
-                        f"Outbound: Node {peer_ip} is at block height: {received_block_height}")
-
-                    if int(received_block_height) < db_block_height:
-                        logger.app_log.warning(
-                            f"Outbound: We have a higher block ({db_block_height}) than {peer_ip} ({received_block_height}), sending")
-
-                        data = receive(s)  # receive client's last block_hash
-
-                        # send all our followup hashes
-                        logger.app_log.info(f"Outbound: Will seek the following block: {data}")
-
-                        # consensus pool 2 (active connection)
-                        consensus_blockheight = int(received_block_height)
-                        node.peers.consensus_add(peer_ip, consensus_blockheight, s, node.last_block)
-                        # consensus pool 2 (active connection)
-
-                        try:
-                            db_handler_instance.execute_param(db_handler_instance.h3, "SELECT block_height FROM transactions WHERE block_hash = ?;",
-                                                              (data,))
-                            client_block = db_handler_instance.h3.fetchone()[0]
-                        except Exception:
-                            logger.app_log.warning(f"Outbound: Block {data[:8]} of {peer_ip} not found")
-                            send(s, "blocknf")
-                            send(s, data)
-
-                        else:
-
-                            logger.app_log.info(
-                                f"Outbound: Node is at block {client_block}")  # now check if we have any newer
-
-                            db_handler_instance.execute(db_handler_instance.h3,
-                                                        'SELECT block_hash FROM transactions ORDER BY block_height DESC LIMIT 1')
-                            db_block_hash = db_handler_instance.h3.fetchone()[0]  # get latest block_hash
-
-                            if db_block_hash == data or not node.egress:
-                                if not node.egress:
-                                    logger.app_log.warning(f"Outbound: Egress disabled for {peer_ip}")
-                                    time.sleep(int(node.pause_conf))  # reduce CPU usage
-                                else:
-                                    logger.app_log.info(f"Outbound: Node {peer_ip} has the latest block")
-                                    # TODO: this is unlikely to happen due to conditions above, consider removing
-                                send(s, "nonewblk")
-
-                            else:
-                                blocks_fetched = []
-                                while sys.getsizeof(
-                                        str(blocks_fetched)) < 500000:  # limited size based on txs in blocks
-                                    # db_handler.execute_param(db_handler.h3, ("SELECT block_height, timestamp,address,recipient,amount,signature,public_key,keep,openfield FROM transactions WHERE block_height > ? AND block_height <= ?;"),(str(int(client_block)),) + (str(int(client_block + 1)),))
-                                    db_handler_instance.execute_param(db_handler_instance.h3, (
-                                        "SELECT timestamp,address,recipient,amount,signature,public_key,operation,openfield FROM transactions WHERE block_height > ? AND block_height <= ?;"),
-                                                                      (str(int(client_block)), str(int(client_block + 1)),))
-                                    result = db_handler_instance.h3.fetchall()
-                                    if not result:
-                                        break
-                                    blocks_fetched.extend([result])
-                                    client_block = int(client_block) + 1
-
-                                # blocks_send = [[l[1:] for l in group] for _, group in groupby(blocks_fetched, key=itemgetter(0))]  # remove block number
-
-                                logger.app_log.info(f"Outbound: Selected {blocks_fetched}")
-
-                                send(s, "blocksfnd")
-
-                                confirmation = receive(s)
-
-                                if confirmation == "blockscf":
-                                    logger.app_log.info("Outbound: Client confirmed they want to sync from us")
-                                    send(s, blocks_fetched)
-
-                                elif confirmation == "blocksrj":
-                                    logger.app_log.info(
-                                        "Outbound: Client rejected to sync from us because we're dont have the latest block")
-
-
-
-                    elif int(received_block_height) >= db_block_height:
-                        if int(received_block_height) == db_block_height:
-                            logger.app_log.info(f"Outbound: We have the same block as {peer_ip} ({received_block_height}), hash will be verified")
-                        else:
-                            logger.app_log.warning(f"Outbound: We have a lower block ({db_block_height}) than {peer_ip} ({received_block_height}), hash will be verified")
-
-                        db_handler_instance.execute(db_handler_instance.c, 'SELECT block_hash FROM transactions ORDER BY block_height DESC LIMIT 1')
-                        db_block_hash = db_handler_instance.c.fetchone()[0]  # get latest block_hash
-
-                        logger.app_log.info(f"Outbound: block_hash to send: {db_block_hash}")
-                        send(s, db_block_hash)
-
-                        ensure_good_peer_version(host)
-
-                        # consensus pool 2 (active connection)
-                        consensus_blockheight = int(received_block_height)  # str int to remove leading zeros
-                        node.peers.consensus_add(peer_ip, consensus_blockheight, s, node.last_block)
-                        # consensus pool 2 (active connection)
-
-                except Exception as e:
-                    logger.app_log.info(f"Outbound: Sync failed {e}")
-                finally:
-                    node.syncing.remove(peer_ip)
-
-            elif data == "blocknf":  # one of the possible outcomes
-                block_hash_delete = receive(s)
-                # print peer_ip
-                # if max(consensus_blockheight_list) == int(received_block_height):
-                if int(received_block_height) == node.peers.consensus_max:
-                    blocknf(block_hash_delete, peer_ip, db_handler_instance)
-
-                    if node.peers.warning(s, peer_ip, "Rollback", 2):
-                        raise ValueError(f"{peer_ip} is banned")
-
-                sendsync(s, peer_ip, "Block not found", False)
-
-            elif data == "blocksfnd":
-                logger.app_log.info(f"Outbound: Node {peer_ip} has the block(s)")  # node should start sending txs in this step
-
-                # logger.app_log.info("Inbound: Combined segments: " + segments)
-                # print peer_ip
-                if db_lock.locked():
-                    logger.app_log.warning(f"Skipping sync from {peer_ip}, syncing already in progress")
-
-                else:
-                    db_handler_instance.execute(db_handler_instance.c,
-                                                "SELECT timestamp FROM transactions WHERE reward != 0 ORDER BY block_height DESC LIMIT 1;")  # or it takes the first
-                    node.last_block_timestamp = quantize_two(db_handler_instance.c.fetchone()[0])
-
-                    if int(node.last_block_timestamp) < (time.time() - 600):
-                        block_req = node.peers.consensus_most_common
-                        logger.app_log.warning("Most common block rule triggered")
-
-                    else:
-                        block_req = node.peers.consensus_max
-                        logger.app_log.warning("Longest chain rule triggered")
-
-                    ensure_good_peer_version(host)
-
-                    if int(received_block_height) >= block_req:
-                        try:  # they claim to have the longest chain, things must go smooth or ban
-                            logger.app_log.warning(f"Confirming to sync from {peer_ip}")
-
-                            send(s, "blockscf")
-                            segments = receive(s)
-                            ensure_good_peer_version(host)
-
-                        except:
-                            if node.peers.warning(s, peer_ip, "Failed to deliver the longest chain", 2):
-                                raise ValueError(f"{peer_ip} is banned")
-
-                        else:
-                            digest_block(segments, s, peer_ip, db_handler_instance)
-
-                            # receive theirs
-                    else:
-                        send(s, "blocksrj")
-                        logger.app_log.warning(f"Inbound: Distant peer {peer_ip} is at {received_block_height}, should be at least {block_req}")
-
-                sendsync(s, peer_ip, "Block found", True)
-
-                # block_hash validation end
-
-            elif data == "nonewblk":
-                # send and receive mempool
-                if mp.MEMPOOL.sendable(peer_ip):
-                    mempool_txs = mp.MEMPOOL.tx_to_send(peer_ip)
-                    # logger.app_log.info("Outbound: Extracted from the mempool: " + str(mempool_txs))  # improve: sync based on signatures only
-                    # if len(mempool_txs) > 0: #wont sync mempool until we send something, which is bad
-                    # send own
-                    send(s, "mempool")
-                    send(s, mempool_txs)
-                    # send own
-                    # receive theirs
-                    segments = receive(s)
-                    logger.app_log.info(mp.MEMPOOL.merge(segments, peer_ip, db_handler_instance.c, True))
-                    # receive theirs
-                    # Tell the mempool we just send our pool to a peer
-                    mp.MEMPOOL.sent(peer_ip)
-                sendsync(s, peer_ip, "No new block", True)
-
-            elif data == "hyperlane":
-                pass
-
-            else:
-                if data == '*':
-                    raise ValueError("Broken pipe")
-                raise ValueError(f"Unexpected error, received: {str(data)[:32]}")
-
-        except Exception as e:
-            """
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-            print(exc_type, fname, exc_tb.tb_lineno)
-            """
-            # remove from active pool
-            if this_client in node.peers.connection_pool:
-                logger.app_log.info(
-                    f"Will remove {this_client} from active pool {node.peers.connection_pool}")
-                logger.app_log.warning(f"Outbound: Disconnected from {this_client}: {e}")
-                node.peers.remove_client(this_client)
-
-            # remove from active pool
-
-            # remove from consensus 2
-            try:
-                node.peers.consensus_remove(peer_ip)
-            except:
-                pass
-            # remove from consensus 2
-
-            logger.app_log.info(f"Connection to {this_client} terminated due to {e}")
-            logger.app_log.info(f"---thread {threading.currentThread()} ended---")
-
-            db_handler_instance.close_all()
-            # properly end the connection
-            if s:
-                s.close()
-            # properly end the connection
-            if node.debug_conf:
-                raise  # major debug client
-            else:
-                logger.app_log.info(f"Ending thread, because {e}")
-                return
-
-    if not node.peers.version_allowed(host, node.version_allow):
-        logger.app_log.warning(f"Outbound: Ending thread, because {host} has too old a version: {node.peers.ip_to_mainnet[host]}")
 
 
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -2805,8 +1849,8 @@ def setup_net_type():
         node.is_testnet = False
         node.is_mainnet = False
 
-    logger.app_log.warning(f"Testnet: {node.is_testnet}")
-    logger.app_log.warning(f"Regnet : {node.is_regnet}")
+    node.logger.app_log.warning(f"Testnet: {node.is_testnet}")
+    node.logger.app_log.warning(f"Regnet : {node.is_regnet}")
 
     # default mainnet config
     node.peerfile = "peers.txt"
@@ -2821,16 +1865,16 @@ def setup_net_type():
             node.version_allow = ['mainnet0019', 'mainnet0020', 'mainnet0021']
         # Do not allow bad configs.
         if not 'mainnet' in node.version:
-            logger.app_log.error("Bad mainnet version, check config.txt")
+            node.logger.app_log.error("Bad mainnet version, check config.txt")
             sys.exit()
         num_ver = just_int_from(node.version)
         if num_ver < 19:
-            logger.app_log.error("Too low mainnet version, check config.txt")
+            node.logger.app_log.error("Too low mainnet version, check config.txt")
             sys.exit()
         for allowed in node.version_allow:
             num_ver = just_int_from(allowed)
             if num_ver < 19:
-                logger.app_log.error("Too low allowed version, check config.txt")
+                node.logger.app_log.error("Too low allowed version, check config.txt")
                 sys.exit()
 
     if node.is_testnet:
@@ -2843,7 +1887,7 @@ def setup_net_type():
         node.peerfile = "peers_test.txt"
         node.index_db = "static/index_test.db"
         if not 'testnet' in node.version:
-            logger.app_log.error("Bad testnet version, check config.txt")
+            node.logger.app_log.error("Bad testnet version, check config.txt")
             sys.exit()
 
         redownload_test = input("Status: Welcome to the testnet. Redownload test ledger? y/n")
@@ -2868,14 +1912,14 @@ def setup_net_type():
         node.peerfile = regnet.REGNET_PEERS
         node.index_db = regnet.REGNET_INDEX
         if not 'regnet' in node.version:
-            logger.app_log.error("Bad regnet version, check config.txt")
+            node.logger.app_log.error("Bad regnet version, check config.txt")
             sys.exit()
-        logger.app_log.warning("Regnet init...")
-        regnet.init(logger.app_log)
+        node.logger.app_log.warning("Regnet init...")
+        regnet.init(node.logger.app_log)
         regnet.DIGEST_BLOCK = digest_block
         mining_heavy3.is_regnet = True
         """
-        logger.app_log.warning("Regnet still is WIP atm.")
+        node.logger.app_log.warning("Regnet still is WIP atm.")
         sys.exit()
         """
 
@@ -2886,7 +1930,7 @@ def initial_db_check(database):
     """
     # force bootstrap via adding an empty "fresh_sync" file in the dir.
     if os.path.exists("fresh_sync") and node.is_mainnet:
-        logger.app_log.warning("Status: Fresh sync required, bootstrapping from the website")
+        node.logger.app_log.warning("Status: Fresh sync required, bootstrapping from the website")
         os.remove("fresh_sync")
         bootstrap()
     # UPDATE mainnet DB if required
@@ -2905,10 +1949,10 @@ def initial_db_check(database):
             print("Database needs upgrading, bootstrapping...")
             bootstrap()
 
-    logger.app_log.warning(f"Status: Indexing tokens from ledger {node.ledger_path_conf}")
-    tokens.tokens_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log, node.plugin_manager)
-    logger.app_log.warning("Status: Indexing aliases")
-    aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", logger.app_log)
+    node.logger.app_log.warning(f"Status: Indexing tokens from ledger {node.ledger_path_conf}")
+    tokens.tokens_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log, node.plugin_manager)
+    node.logger.app_log.warning("Status: Indexing aliases")
+    aliases.aliases_update(node.index_db, node.ledger_path_conf, "normal", node.logger.app_log)
 
     try:
         source_db = sqlite3.connect(node.hyper_path_conf, timeout=1)
@@ -2919,13 +1963,13 @@ def initial_db_check(database):
         node.hdd_block = sc.fetchone()[0]
 
         node.last_block = node.hdd_block
-        checkpoint_set(node.hdd_block)
+        checkpoint_set(node, node.hdd_block)
 
         if node.is_mainnet and (node.hdd_block >= POW_FORK - FORK_AHEAD):
-            limit_version()
+            limit_version(node)
 
         if node.ram_conf:
-            logger.app_log.warning("Status: Moving database to RAM")
+            node.logger.app_log.warning("Status: Moving database to RAM")
             database.to_ram = sqlite3.connect(node.ledger_ram_file, uri=True, timeout=1, isolation_level=None)
             database.to_ram.text_factory = str
             database.tr = database.to_ram.cursor()
@@ -2933,17 +1977,17 @@ def initial_db_check(database):
             query = "".join(line for line in source_db.iterdump())
             database.to_ram.executescript(query)
             # do not close
-            logger.app_log.warning("Status: Moved database to RAM")
+            node.logger.app_log.warning("Status: Moved database to RAM")
 
     except Exception as e:
-        logger.app_log.error(e)
+        node.logger.app_log.error(e)
         sys.exit()
 
 
 def load_keys():
     """Initial loading of crypto keys"""
 
-    essentials.keys_check(logger.app_log, "wallet.der")
+    essentials.keys_check(node.logger.app_log, "wallet.der")
 
     node_keys.key, node_keys.public_key_readable, node_keys.private_key_readable, _, _, node_keys.public_key_hashed, node_keys.address, node_keys.keyfile = essentials.keys_load(
         "privkey.der", "pubkey.der")
@@ -2954,16 +1998,16 @@ def load_keys():
         regnet.ADDRESS = node_keys.address
         regnet.KEY = node_keys.key
 
-    logger.app_log.warning(f"Status: Local address: {node_keys.address}")
+    node.logger.app_log.warning(f"Status: Local address: {node_keys.address}")
 
 
 def verify(db_handler):
     try:
-        logger.app_log.warning("Blockchain verification started...")
+        node.logger.app_log.warning("Blockchain verification started...")
         # verify blockchain
         db_handler.execute(db_handler.h3, "SELECT Count(*) FROM transactions")
         db_rows = db_handler.h3.fetchone()[0]
-        logger.app_log.warning("Total steps: {}".format(db_rows))
+        node.logger.app_log.warning("Total steps: {}".format(db_rows))
 
         # verify genesis
         if node.full_ledger:
@@ -2971,10 +2015,10 @@ def verify(db_handler):
             result = db_handler.h3.fetchall()[0]
             block_height = result[0]
             genesis = result[1]
-            logger.app_log.warning(f"Genesis: {genesis}")
+            node.logger.app_log.warning(f"Genesis: {genesis}")
             if str(genesis) != node.genesis_conf and int(
                     block_height) == 0:
-                logger.app_log.warning("Invalid genesis address")
+                node.logger.app_log.warning("Invalid genesis address")
                 sys.exit(1)
         # verify genesis
 
@@ -3021,17 +2065,17 @@ def verify(db_handler):
             else:
                 try:
                     if sha_hash.hexdigest() != db_hashes[db_block_height + "-" + db_timestamp]:
-                        logger.app_log.warning("Signature validation problem: {} {}".format(db_block_height, db_transaction))
+                        node.logger.app_log.warning("Signature validation problem: {} {}".format(db_block_height, db_transaction))
                         invalid = invalid + 1
                 except:
-                    logger.app_log.warning("Signature validation problem: {} {}".format(db_block_height, db_transaction))
+                    node.logger.app_log.warning("Signature validation problem: {} {}".format(db_block_height, db_transaction))
                     invalid = invalid + 1
 
         if invalid == 0:
-            logger.app_log.warning("All transacitons in the local ledger are valid")
+            node.logger.app_log.warning("All transacitons in the local ledger are valid")
 
     except Exception as e:
-        logger.app_log.warning("Error: {}".format(e))
+        node.logger.app_log.warning("Error: {}".format(e))
         raise
 
 
@@ -3039,7 +2083,7 @@ if __name__ == "__main__":
     # classes
     q = queue.Queue()
     node = classes.Node()
-    logger = classes.Logger()
+    node.logger = classes.Logger()
     node_keys = classes.Keys()
 
     node.is_testnet = False
@@ -3052,6 +2096,9 @@ if __name__ == "__main__":
     config.read()
     # classes
 
+
+
+    node.app_version = app_version
     node.version = config.version_conf
     node.debug_level = config.debug_level_conf
     node.port = config.port
@@ -3076,8 +2123,8 @@ if __name__ == "__main__":
 
     node.IS_STOPPING = False
 
-    logger.app_log = log.log("node.log", node.debug_level_conf, node.terminal_output)
-    logger.app_log.warning("Configuration settings loaded")
+    node.logger.app_log = log.log("node.log", node.debug_level_conf, node.terminal_output)
+    node.logger.app_log.warning("Configuration settings loaded")
 
     # upgrade wallet location after nuitka-required "files" folder introduction
     if os.path.exists("../wallet.der") and not os.path.exists("wallet.der") and "Windows" in platform.system():
@@ -3088,35 +2135,41 @@ if __name__ == "__main__":
     mining_heavy3.mining_open()
     try:
         # create a plugin manager, load all plugin modules and init
-        node.plugin_manager = plugins.PluginManager(app_log=logger.app_log, init=True)
+        node.plugin_manager = plugins.PluginManager(app_log=node.logger.app_log, init=True)
 
         setup_net_type()
         load_keys()
 
-        logger.app_log.warning(f"Status: Starting node version {VERSION}")
+        node.logger.app_log.warning(f"Status: Starting node version {app_version}")
         node.startup_time = time.time()
         try:
 
-            node.peers = peershandler.Peers(logger.app_log, config)
+            node.peers = peershandler.Peers(node.logger.app_log, config, node)
 
             # print(peers.peer_list_old_format())
             # sys.exit()
 
-            node.apihandler = apihandler.ApiHandler(logger.app_log, config)
-            mp.MEMPOOL = mp.Mempool(logger.app_log, config, db_lock, node.is_testnet)
+            node.apihandler = apihandler.ApiHandler(node.logger.app_log, config)
+            mp.MEMPOOL = mp.Mempool(node.logger.app_log, config, node.db_lock, node.is_testnet)
 
             check_integrity(node.hyper_path_conf)
-            ledger_compress()  # this does not work after init_database is loaded
+            #PLACEHOLDER FOR FRESH HYPERBLOCK BUILDER
 
             # if node.rebuild_db_conf: #does nothing
             #    db_maintenance(init_database)
 
-            # db_manager = db_looper.DbManager(logger.app_log)
+            # db_manager = db_looper.DbManager(node.logger.app_log)
             # db_manager.start()
 
-            db_handler_initial = dbhandler.DbHandler(node.index_db, node.ledger_path_conf, node.hyper_path_conf, node.full_ledger, node.ram_conf, node.ledger_ram_file, logger, q)
+            db_handler_initial = dbhandler.DbHandler(node.index_db, node.ledger_path_conf, node.hyper_path_conf, node.full_ledger, node.ram_conf, node.ledger_ram_file, node.logger)
+            ledger_check_heights(node, db_handler_initial)
+            
+
+
             initial_db_check(db_handler_initial)
-            coherence_check(db_handler_initial)
+            if not node.is_regnet:
+                sequencing_check(db_handler_initial)
+
             if node.verify_conf:
                 verify(db_handler_initial)
 
@@ -3141,25 +2194,36 @@ if __name__ == "__main__":
                 server_thread.daemon = True
                 server_thread.start()
 
-                logger.app_log.warning("Status: Server loop running.")
+                node.logger.app_log.warning("Status: Server loop running.")
 
             else:
-                logger.app_log.warning("Status: Not starting a local server to conceal identity on Tor network")
+                node.logger.app_log.warning("Status: Not starting a local server to conceal identity on Tor network")
 
-            # hyperlane_manager = hyperlane.HyperlaneManager(logger.app_log)
+            # hyperlane_manager = hyperlane.HyperlaneManager(node.logger.app_log)
             # hyperlane_manager.start()
 
             # start connection manager
-            t_manager = threading.Thread(target=manager())
-            logger.app_log.warning("Status: Starting connection manager")
-            t_manager.daemon = True
-            t_manager.start()
+            connection_manager = connectionmanager.ConnectionManager(node, mp)
+            connection_manager.start()
             # start connection manager
 
 
-
         except Exception as e:
-            logger.app_log.info(e)
+            node.logger.app_log.info(e)
             raise
-    finally:
-        mining_heavy3.mining_close()
+
+    except Exception as e:
+        node.logger.app_log.info(e)
+        raise
+
+    node.logger.app_log.warning("Status: Bismuth loop running.")
+
+
+    while True:
+        if node.IS_STOPPING:
+            if node.db_lock.locked():
+                time.sleep(0.1)
+            else:
+                mining_heavy3.mining_close()
+                node.logger.app_log.warning("Status: Successfully stopped.")
+        time.sleep(1)
